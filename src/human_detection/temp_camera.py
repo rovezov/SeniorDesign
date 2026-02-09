@@ -1,10 +1,16 @@
-# Temporary Camera Module for Frame Capture
+"""
+Temporary Camera Module
+
+Provides FPS-controlled camera frame capture for video processing.
+"""
 
 import cv2
 import time
 
+
 class TempCamera:
     """Captures frames from camera at a fixed rate"""
+    
     def __init__(self, camera_id=0, fps=10):
         self.camera_id = camera_id
         self.fps = fps
@@ -63,4 +69,3 @@ class TempCamera:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-        

@@ -1,20 +1,20 @@
 """
 Human Detection and Tracking Demo
 
-This script demonstrates person detection and tracking using YOLO ONNX model
-with centroid-based tracking to assign persistent IDs. Automatically saves one
-cropped image per tracked person ID to the Output_images folder.
+Detects and tracks persons with persistent IDs, saving high-quality cropped images 
+optimized for PPE detection when persons leave the camera view.
 
 Usage:
-    python run_demo.py [--camera CAMERA_ID] [--fps FPS] [--duration DURATION] [--edge-margin PIXELS]
+    python run_demo.py [--camera ID] [--fps FPS] [--duration SEC] [--edge-margin PX]
 
 Controls:
-    - Press 'q' or ESC to quit
+    Press 'q' or ESC to quit
 
-Note:
-    - The Output_images folder is cleared when the script starts
-    - One cropped image per person ID is saved after 2 seconds of stable tracking
-    - Use --edge-margin to filter detections near frame edges (helps prevent duplicate IDs)
+Features:
+    - Quality-based crop selection (saves best frame when person departs)
+    - Persistent ID tracking across frames
+    - Minimum 2 seconds tracking before saving
+    - Output saved to Output_images/ folder
 """
 
 import cv2
@@ -23,49 +23,44 @@ import time
 import os
 import glob
 from temp_camera import TempCamera
-from human_identifier import HumanTracker, detect_humans, crop_person
+from human_identifier import HumanIdentificationService
 
 
-def run_demo(camera_id=0, fps=15, duration=None, edge_margin=0, debug=False):
-    """
-    Run the human detection and tracking demo
+def save_remaining_crops(identification_service, output_dir):
+    """Save crops for persons still being tracked"""
+    remaining_crops = identification_service.get_all_tracked_crops()
+    for person_data in remaining_crops:
+        filename = os.path.join(output_dir, f"person_id_{person_data['id']}.jpg")
+        cv2.imwrite(filename, person_data['crop'])
+        identification_service.saved_ids.add(person_data['id'])
+        print(f"[EXIT] Saved person_id_{person_data['id']}.jpg (quality {person_data['quality']:.2f})")
+    return len(remaining_crops)
+
+
+def run_demo(camera_id=0, fps=15, duration=None, edge_margin=0):
+    """Run human detection and tracking demo"""
+    print(f"Starting detection service (Camera {camera_id}, {fps} FPS, Edge margin {edge_margin}px)")
+    print("Press 'q' or ESC to quit")
     
-    Args:
-        camera_id: Camera device ID (default: 0)
-        fps: Frames per second to process (default: 15)
-        duration: Duration in seconds to run (None = indefinite)
-        edge_margin: Pixels from edge to filter detections (0 to disable, default: 0)
-        debug: Enable debug output (default: False)
-    """
-    print(f"Starting human detection demo...")
-    print(f"Camera: {camera_id}, FPS: {fps}, Edge margin: {edge_margin}px, Debug: {debug}")
-    print(f"Press 'q' or ESC to quit")
-    
-    # Initialize camera and tracker
     camera = TempCamera(camera_id=camera_id, fps=fps)
-    # Tracker with improved parameters for walking pace detection
-    tracker = HumanTracker(max_disappeared=30, persistence_window=10, 
-                          min_tracking_time=2.0, max_centroid_distance=150)
+    identification_service = HumanIdentificationService(
+        edge_margin=edge_margin,
+        min_tracking_time=2.0,
+        max_centroid_distance=150,
+        conf_threshold=0.15
+    )
     
-    # Create output directory and clear existing images
     output_dir = os.path.join(os.path.dirname(__file__), 'Output_images')
     os.makedirs(output_dir, exist_ok=True)
     
-    # Clear all existing images in the folder
-    existing_images = glob.glob(os.path.join(output_dir, '*.jpg'))
-    existing_images += glob.glob(os.path.join(output_dir, '*.png'))
-    for img_path in existing_images:
+    for img_path in glob.glob(os.path.join(output_dir, '*.jpg')) + glob.glob(os.path.join(output_dir, '*.png')):
         try:
             os.remove(img_path)
-        except Exception as e:
-            print(f"Warning: Could not remove {img_path}: {e}")
-    print(f"Cleared {len(existing_images)} existing images from output folder")
+        except Exception:
+            pass
     
-    # Track which person IDs have been saved
-    saved_ids = set()
-    
-    fps_history = []
     frame_count = 0
+    fps_history = []
     
     try:
         camera.start()
@@ -73,88 +68,59 @@ def run_demo(camera_id=0, fps=15, duration=None, edge_margin=0, debug=False):
         for frame in camera.get_frames(duration=duration):
             t0 = time.time()
             frame_count += 1
+            results = identification_service.process_frame(frame)
             
-            # Print debug info every 30 frames (about every 2 seconds at 15fps)
-            debug_this_frame = debug and (frame_count % 30 == 1)
-            
-            if debug_this_frame:
-                print(f"\n=== Frame {frame_count} ===")
-            
-            # Detect humans in frame (with edge filtering built-in)
-            bboxes = detect_humans(frame, edge_margin=edge_margin, debug=debug_this_frame)
-            
-            # Update tracker with detections
-            objects = tracker.update(bboxes)
-            
-            # Draw detections and IDs
-            for (x, y, w, h) in bboxes:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
-            # Draw tracked objects with IDs and save cropped images for new IDs
-            for object_id, centroid in objects.items():
-                # Draw centroid
-                cv2.circle(frame, tuple(centroid), 4, (0, 0, 255), -1)
+            for person in results:
+                if person.get('departed', False) and person['is_new'] and person['crop'] is not None:
+                    filename = os.path.join(output_dir, f"person_id_{person['id']}.jpg")
+                    cv2.imwrite(filename, person['crop'])
+                    print(f"[{frame_count}] Saved person_id_{person['id']}.jpg (departed)")
+                    continue
                 
-                # Draw ID
-                text = f"ID {object_id}"
-                cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
+                if person['bbox'] is not None:
+                    x, y, w, h = person['bbox']
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                cx, cy = person['centroid']
+                cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+                cv2.putText(frame, f"ID {person['id']}", (cx - 10, cy - 10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                # Check if ready to save (persistent tracking + min time)
-                if tracker.is_ready_to_save(object_id):
-                    tracking_duration = tracker.get_tracking_duration(object_id)
-                    cv2.putText(frame, "TRACKED", (centroid[0] - 10, centroid[1] + 20),
+                if person['ready_to_save']:
+                    cv2.putText(frame, "TRACKED", (cx - 10, cy + 20),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    
-                    # Save cropped person image if not already saved
-                    if object_id not in saved_ids:
-                        # Find the bbox that contains this centroid
-                        for (x, y, w, h) in bboxes:
-                            cx = x + w // 2
-                            cy = y + h // 2
-                            # Check if this bbox's centroid matches the tracked centroid
-                            if abs(cx - centroid[0]) < 20 and abs(cy - centroid[1]) < 20:
-                                # Crop the person
-                                person_crop = crop_person(frame, (x, y, w, h))
-                                if person_crop is not None and person_crop.size > 0:
-                                    # Save the cropped image
-                                    filename = os.path.join(output_dir, f'person_id_{object_id}.jpg')
-                                    cv2.imwrite(filename, person_crop)
-                                    saved_ids.add(object_id)
-                                    print(f"Saved cropped person: {filename} (tracked for {tracking_duration:.1f}s)")
-                                break
             
-            # Calculate and display FPS
-            dt = time.time() - t0
-            current_fps = 1.0 / dt if dt > 0 else 0.0
-            fps_history.append(current_fps)
+            fps_history.append(1.0 / (time.time() - t0 or 1e-6))
             if len(fps_history) > 30:
                 fps_history.pop(0)
             avg_fps = sum(fps_history) / len(fps_history)
             
-            # Display info
+            detected_count = sum(1 for p in results if p['bbox'] is not None)
+            
             cv2.putText(frame, f"FPS: {avg_fps:.1f}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-            cv2.putText(frame, f"Detected: {len(bboxes)}", (10, 70),
+            cv2.putText(frame, f"Detected: {detected_count}", (10, 70),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Tracked: {len(objects)}", (10, 100),
+            cv2.putText(frame, f"Tracked: {len(results)}", (10, 100),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Saved: {len(saved_ids)}", (10, 130),
+            cv2.putText(frame, f"Saved: {len(identification_service.saved_ids)}", (10, 130),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             
-            # Display frame
-            cv2.imshow('Human Detection and Tracking Demo', frame)
+            cv2.imshow('Human Detection and Tracking', frame)
             
-            # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
-            if key == 27 or key == ord('q'):  # ESC or 'q'
-                print("Exiting...")
+            if key == 27 or key == ord('q'):
+                print("\nExiting...")
                 break
         
-        print("Demo completed.")
+        print(f"\nProcessed {frame_count} frames")
+        saved = save_remaining_crops(identification_service, output_dir)
+        print(f"Total persons saved: {len(identification_service.saved_ids)}")
         
     except KeyboardInterrupt:
-        print("\nInterrupted by user.")
+        print(f"\n\nInterrupted. Processed {frame_count} frames")
+        save_remaining_crops(identification_service, output_dir)
+        print(f"Total persons saved: {len(identification_service.saved_ids)}")
     except Exception as e:
         print(f"Error: {e}")
         import traceback
@@ -169,18 +135,15 @@ def main():
     parser.add_argument('--camera', '-c', type=int, default=0,
                        help='Camera device ID (default: 0)')
     parser.add_argument('--fps', '-f', type=int, default=15,
-                       help='Frames per second to process (default: 15)')
+                       help='Frames per second (default: 15)')
     parser.add_argument('--duration', '-d', type=float, default=None,
-                       help='Duration in seconds to run (default: indefinite)')
+                       help='Duration in seconds (default: indefinite)')
     parser.add_argument('--edge-margin', '-e', type=int, default=0,
-                       help='Pixels from edge to filter detections (0=disabled, default: 0)')
-    parser.add_argument('--debug', action='store_true',
-                       help='Enable debug output to diagnose detection issues')
+                       help='Pixels from edge to filter detections (default: 0)')
     
     args = parser.parse_args()
-    
     run_demo(camera_id=args.camera, fps=args.fps, duration=args.duration, 
-             edge_margin=args.edge_margin, debug=args.debug)
+             edge_margin=args.edge_margin)
 
 
 if __name__ == '__main__':

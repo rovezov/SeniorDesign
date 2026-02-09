@@ -1,25 +1,305 @@
+"""
+Human Identification Service
 
+Provides real-time person detection and tracking using YOLO.
+Maintains persistent IDs across frames and outputs cropped person images.
+"""
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 import os
+import time
 from scipy.spatial import distance as dist
 from collections import OrderedDict, deque
 
 
+class HumanIdentificationService:
+    """
+    Service for detecting, tracking, and identifying humans in video frames.
+    Maintains state across frames and provides high-quality cropped person images
+    optimized for PPE detection.
+    
+    Features:
+    - YOLO-based person detection
+    - Centroid tracking with persistent IDs
+    - Quality-based crop selection (chooses best frame for PPE visibility)
+    - Automatic filtering of edge detections
+    """
+    
+    def __init__(self, model_path=None, edge_margin=0, min_tracking_time=2.0, 
+                 max_centroid_distance=150, conf_threshold=0.15):
+        """
+        Initialize the human identification service.
+        
+        Args:
+            model_path: Path to YOLO ONNX model (auto-detected if None)
+            edge_margin: Pixels from edge to filter detections (0 to disable)
+            min_tracking_time: Minimum seconds to track before saving
+            max_centroid_distance: Max pixel distance for tracking
+            conf_threshold: Confidence threshold for YOLO detections
+        """
+        self.edge_margin = edge_margin
+        self.conf_threshold = conf_threshold
+        
+        # Initialize YOLO session
+        if model_path is None:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            model_path = os.path.join(current_dir, 'model', 'yolov8n.onnx')
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"YOLO model not found at {model_path}")
+        
+        self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_size = 640
+        
+        self.tracker = HumanTracker(
+            max_disappeared=10,
+            persistence_window=10,
+            min_tracking_time=min_tracking_time,
+            max_centroid_distance=max_centroid_distance
+        )
+        self.saved_ids = set()
+    
+    def process_frame(self, frame):
+        """Process frame and return detected/tracked persons with quality-based crop selection"""
+        bboxes = self._detect_humans(frame)
+        tracked_objects, deregistered_info = self.tracker.update(bboxes)
+        frame_h, frame_w = frame.shape[:2]
+        results = []
+        
+        # Handle departed persons
+        for departed_id, info in deregistered_info.items():
+            if departed_id not in self.saved_ids and info['crop'] is not None:
+                if info['quality'] > 0.3 and info['duration'] >= self.tracker.min_tracking_time:
+                    results.append({
+                        'id': departed_id,
+                        'centroid': (0, 0),
+                        'bbox': None,
+                        'crop': info['crop'],
+                        'ready_to_save': True,
+                        'tracking_duration': info['duration'],
+                        'is_new': True,
+                        'departed': True
+                    })
+                    self.saved_ids.add(departed_id)
+        
+        # Handle currently tracked persons
+        for object_id, centroid in tracked_objects.items():
+            result = {
+                'id': object_id,
+                'centroid': tuple(centroid),
+                'bbox': None,
+                'crop': None,
+                'ready_to_save': self.tracker.is_ready_to_save(object_id),
+                'tracking_duration': self.tracker.get_tracking_duration(object_id),
+                'is_new': False,
+                'departed': False
+            }
+            
+            for (x, y, w, h) in bboxes:
+                cx, cy = x + w // 2, y + h // 2
+                if abs(cx - centroid[0]) < 20 and abs(cy - centroid[1]) < 20:
+                    result['bbox'] = (x, y, w, h)
+                    crop = self._crop_person(frame, (x, y, w, h))
+                    if crop is not None and crop.size > 0:
+                        self.tracker.update_best_crop(object_id, crop, (x, y, w, h), frame_w, frame_h)
+                    break
+            
+            results.append(result)
+        
+        return results
+    
+    def _detect_humans(self, image, debug=False):
+        """Detect humans in image and return bounding boxes (x, y, w, h)"""
+        orig_h, orig_w = image.shape[:2]
+        
+        # Preprocess
+        img, ratio, (dw, dh) = self._letterbox(image)
+        img = img[:, :, ::-1].astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))[None].astype(np.float32)
+        
+        # Inference
+        outputs = self.session.run(None, {self.input_name: img})
+        pred = outputs[0] if isinstance(outputs, list) and len(outputs) == 1 else None
+        if pred is None:
+            for o in outputs:
+                if isinstance(o, np.ndarray) and o.ndim == 3:
+                    pred = o
+                    break
+        if pred is None:
+            return []
+        
+        detections = self._decode_yolo_output(pred)
+        person_boxes = []
+        for box, score, cid in detections:
+            if cid == 0:
+                x1, y1, x2, y2 = box
+                x1 = int(max(0, min(orig_w - 1, (x1 - dw) / ratio)))
+                x2 = int(max(0, min(orig_w - 1, (x2 - dw) / ratio)))
+                y1 = int(max(0, min(orig_h - 1, (y1 - dh) / ratio)))
+                y2 = int(max(0, min(orig_h - 1, (y2 - dh) / ratio)))
+                if x2 > x1 and y2 > y1:
+                    person_boxes.append(([x1, y1, x2, y2], score))
+        
+        if not person_boxes:
+            return []
+        
+        boxes_arr = np.array([p[0] for p in person_boxes])
+        scores_arr = np.array([p[1] for p in person_boxes])
+        keep = self._nms(boxes_arr, scores_arr)
+        
+        result = []
+        for box in boxes_arr[keep]:
+            x1, y1, x2, y2 = box
+            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
+            if self.edge_margin > 0:
+                if (x < self.edge_margin or y < self.edge_margin or
+                    x + w > orig_w - self.edge_margin or y + h > orig_h - self.edge_margin):
+                    continue
+            result.append((x, y, w, h))
+        
+        return result
+    
+    def _letterbox(self, img):
+        """Resize and pad image"""
+        shape = img.shape[:2]
+        new_shape = (self.input_size, self.input_size)
+        r = min(new_shape[0] / shape[1], new_shape[1] / shape[0])
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw = (new_shape[0] - new_unpad[0]) / 2
+        dh = (new_shape[1] - new_unpad[1]) / 2
+        img_resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, 
+                                        cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        return img_padded, r, (left, top)
+    
+    def _decode_yolo_output(self, pred):
+        """Decode YOLO output to detections"""
+        if pred.ndim == 3:
+            pred = pred[0]
+        if pred.ndim == 2 and pred.shape[0] <= 200 and pred.shape[1] > pred.shape[0]:
+            pred = pred.T
+        
+        xywh = pred[:, 0:4].astype(np.float32)
+        num_classes = pred.shape[1] - 4
+        
+        if num_classes >= 20:
+            conf = np.ones((pred.shape[0],), dtype=np.float32)
+            class_scores = pred[:, 4:]
+        else:
+            conf = pred[:, 4].astype(np.float32)
+            class_scores = pred[:, 5:]
+        
+        class_ids = np.argmax(class_scores, axis=1)
+        class_conf = class_scores[np.arange(class_scores.shape[0]), class_ids]
+        scores = conf * class_conf
+        
+        mask = scores > self.conf_threshold
+        if not np.any(mask):
+            return []
+        
+        xywh = xywh[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+        
+        if np.max(xywh) <= 1.01:
+            xywh = xywh * float(self.input_size)
+        
+        boxes = []
+        for x, s, cid in zip(xywh, scores, class_ids):
+            x, y, w, h = x.tolist()
+            box = [x - w/2, y - h/2, x + w/2, y + h/2]
+            boxes.append((box, float(s), int(cid)))
+        return boxes
+    
+    def _nms(self, boxes, scores, iou_threshold=0.45):
+        """Non-maximum suppression"""
+        idxs = np.argsort(-scores)
+        keep = []
+        while idxs.size > 0:
+            i = idxs[0]
+            keep.append(i)
+            if idxs.size == 1:
+                break
+            ious = self._bbox_iou(boxes[i], boxes[idxs[1:]])
+            idxs = idxs[1:][ious <= iou_threshold]
+        return keep
+    
+    def _bbox_iou(self, box, other_boxes):
+        """Calculate IoU"""
+        x1 = np.maximum(box[0], other_boxes[:, 0])
+        y1 = np.maximum(box[1], other_boxes[:, 1])
+        x2 = np.minimum(box[2], other_boxes[:, 2])
+        y2 = np.minimum(box[3], other_boxes[:, 3])
+        inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        area1 = (box[2] - box[0]) * (box[3] - box[1])
+        area2 = (other_boxes[:, 2] - other_boxes[:, 0]) * (other_boxes[:, 3] - other_boxes[:, 1])
+        return inter / np.maximum(area1 + area2 - inter, 1e-8)
+    
+    def _crop_person(self, image, bbox):
+        """Crop person from image"""
+        x, y, w, h = bbox
+        x1, y1 = int(x), int(y)
+        x2, y2 = int(x + w), int(y + h)
+        
+        h_img, w_img = image.shape[:2]
+        x1 = max(0, min(w_img - 1, x1))
+        x2 = max(0, min(w_img, x2))
+        y1 = max(0, min(h_img - 1, y1))
+        y2 = max(0, min(h_img, y2))
+        
+        if x2 <= x1 or y2 <= y1:
+            return None
+        
+        return image[y1:y2, x1:x2]
+    
+    def get_all_tracked_crops(self):
+        """Get best crops for all currently tracked persons (for saving on exit)"""
+        crops_to_save = []
+        for object_id in list(self.tracker.objects.keys()):
+            if object_id not in self.saved_ids:
+                best_crop = self.tracker.get_best_crop(object_id)
+                duration = self.tracker.get_tracking_duration(object_id)
+                if best_crop is not None and duration >= self.tracker.min_tracking_time:
+                    quality = self.tracker.best_crops[object_id]['quality']
+                    if quality > 0.3:
+                        crops_to_save.append({
+                            'id': object_id,
+                            'crop': best_crop,
+                            'quality': quality,
+                            'duration': duration
+                        })
+        return crops_to_save
+    
+    def reset(self):
+        """Reset tracking state"""
+        self.tracker = HumanTracker(
+            max_disappeared=10,
+            persistence_window=10,
+            min_tracking_time=self.tracker.min_tracking_time,
+            max_centroid_distance=self.tracker.max_centroid_distance
+        )
+        self.saved_ids = set()
+
+
 class HumanTracker:
     """Tracks humans across frames and assigns persistent IDs"""
-    def __init__(self, max_disappeared=30, persistence_window=10, min_tracking_time=2.0, max_centroid_distance=150):
+    
+    def __init__(self, max_disappeared=10, persistence_window=10, min_tracking_time=2.0, max_centroid_distance=150):
         self.next_id = 0
-        self.objects = OrderedDict()  # id -> centroid
-        self.disappeared = OrderedDict()  # id -> count since last seen
+        self.objects = OrderedDict()
+        self.disappeared = OrderedDict()
         self.max_disappeared = max_disappeared
         self.persistence_window = persistence_window
-        self.detection_history = OrderedDict()  # id -> deque of bool (detected in frame)
-        self.first_seen_time = OrderedDict()  # id -> timestamp when first registered
-        self.min_tracking_time = min_tracking_time  # Minimum seconds to track before considering "stable"
-        self.max_centroid_distance = max_centroid_distance  # Max distance for centroid matching
+        self.detection_history = OrderedDict()
+        self.first_seen_time = OrderedDict()
+        self.min_tracking_time = min_tracking_time
+        self.max_centroid_distance = max_centroid_distance
+        self.best_crops = OrderedDict()
         
     def register(self, centroid):
         """Register a new object with next available ID"""
@@ -29,6 +309,7 @@ class HumanTracker:
         self.detection_history[self.next_id] = deque(maxlen=self.persistence_window)
         self.detection_history[self.next_id].append(True)
         self.first_seen_time[self.next_id] = time.time()
+        self.best_crops[self.next_id] = {'crop': None, 'quality': 0.0, 'bbox': None}
         self.next_id += 1
         
     def deregister(self, object_id):
@@ -38,14 +319,15 @@ class HumanTracker:
         del self.detection_history[object_id]
         if object_id in self.first_seen_time:
             del self.first_seen_time[object_id]
+        if object_id in self.best_crops:
+            del self.best_crops[object_id]
         
     def update(self, bboxes):
-        """Update tracked objects with new detections"""
-        # Convert bboxes to centroids
+        """Update tracked objects with new detections and return (tracked_objects, deregistered_info)"""
+        deregistered_info = {}
         input_centroids = np.zeros((len(bboxes), 2), dtype="int")
         for i, (x, y, w, h) in enumerate(bboxes):
-            cx = int(x + w / 2)
-            cy = int(y + h / 2)
+            cx, cy = int(x + w / 2), int(y + h / 2)
             input_centroids[i] = (cx, cy)
         
         # If no objects being tracked, register all
@@ -62,6 +344,13 @@ class HumanTracker:
                     self.disappeared[object_id] += 1
                     self.detection_history[object_id].append(False)
                     if self.disappeared[object_id] > self.max_disappeared:
+                        # Save best crop info before deregistering
+                        if object_id in self.best_crops:
+                            deregistered_info[object_id] = {
+                                'crop': self.best_crops[object_id]['crop'],
+                                'quality': self.best_crops[object_id]['quality'],
+                                'duration': self.get_tracking_duration(object_id)
+                            }
                         self.deregister(object_id)
             else:
                 # Compute distance between each pair of object centroids and input centroids
@@ -95,6 +384,13 @@ class HumanTracker:
                     self.disappeared[object_id] += 1
                     self.detection_history[object_id].append(False)
                     if self.disappeared[object_id] > self.max_disappeared:
+                        # Save best crop info before deregistering
+                        if object_id in self.best_crops:
+                            deregistered_info[object_id] = {
+                                'crop': self.best_crops[object_id]['crop'],
+                                'quality': self.best_crops[object_id]['quality'],
+                                'duration': self.get_tracking_duration(object_id)
+                            }
                         self.deregister(object_id)
                 
                 # Register new objects for unused columns
@@ -102,7 +398,7 @@ class HumanTracker:
                 for col in unused_cols:
                     self.register(input_centroids[col])
         
-        return self.objects
+        return self.objects, deregistered_info
     
     def is_persistent(self, object_id, min_ratio=0.9):
         """Check if an object has been detected in at least min_ratio of recent frames"""
@@ -127,268 +423,83 @@ class HumanTracker:
     
     def get_tracking_duration(self, object_id):
         """Get how long an object has been tracked in seconds"""
-        import time
         if object_id not in self.first_seen_time:
             return 0.0
         return time.time() - self.first_seen_time[object_id]
-
-
-# Global YOLO session (initialized on first use)
-_yolo_session = None
-_model_path = None
-
-
-def _get_yolo_session():
-    """Get or initialize YOLO ONNX session"""
-    global _yolo_session, _model_path
-    if _yolo_session is None:
-        # Find model path
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        _model_path = os.path.join(current_dir, 'model', 'yolov8n.onnx')
-        if not os.path.exists(_model_path):
-            raise FileNotFoundError(f"YOLO model not found at {_model_path}")
-        _yolo_session = ort.InferenceSession(_model_path, providers=['CPUExecutionProvider'])
-    return _yolo_session
-
-
-def letterbox(img, new_shape=(640, 640), color=(114, 114, 114)):
-    """Resize and pad image to meet new_shape while keeping aspect ratio"""
-    shape = img.shape[:2]  # current shape [h, w]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
-    r = min(new_shape[0] / shape[1], new_shape[1] / shape[0])
-    new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
-    dw, dh = new_shape[0] - new_unpad[0], new_shape[1] - new_unpad[1]
-    dw /= 2
-    dh /= 2
-    img_resized = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img_padded = cv2.copyMakeBorder(img_resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return img_padded, r, (left, top)
-
-
-def xywh2xyxy(xywh):
-    """Convert box from center format to corner format"""
-    x, y, w, h = xywh
-    x1 = x - w / 2
-    y1 = y - h / 2
-    x2 = x + w / 2
-    y2 = y + h / 2
-    return [x1, y1, x2, y2]
-
-
-def bbox_iou_np(box, other_boxes):
-    """Calculate IoU between box and other_boxes"""
-    x1 = np.maximum(box[0], other_boxes[:, 0])
-    y1 = np.maximum(box[1], other_boxes[:, 1])
-    x2 = np.minimum(box[2], other_boxes[:, 2])
-    y2 = np.minimum(box[3], other_boxes[:, 3])
-    inter_w = np.maximum(0.0, x2 - x1)
-    inter_h = np.maximum(0.0, y2 - y1)
-    inter = inter_w * inter_h
-    area1 = (box[2] - box[0]) * (box[3] - box[1])
-    area2 = (other_boxes[:, 2] - other_boxes[:, 0]) * (other_boxes[:, 3] - other_boxes[:, 1])
-    union = area1 + area2 - inter
-    iou = inter / np.maximum(union, 1e-8)
-    return iou
-
-
-def nms(boxes, scores, iou_threshold=0.45):
-    """Non-maximum suppression"""
-    idxs = np.argsort(-scores)
-    keep = []
-    while idxs.size > 0:
-        i = idxs[0]
-        keep.append(i)
-        if idxs.size == 1:
-            break
-        ious = bbox_iou_np(boxes[i], boxes[idxs[1:]])
-        idxs = idxs[1:][ious <= iou_threshold]
-    return keep
-
-
-def decode_yolo_output(pred, conf_thres=0.25, input_size=640):
-    """Decode YOLO ONNX output to bounding boxes"""
-    if pred.ndim == 3:
-        pred = pred[0]
     
-    # Handle transposed output
-    if pred.ndim == 2 and pred.shape[0] <= 200 and pred.shape[1] > pred.shape[0]:
-        pred = pred.T
-    
-    if pred.ndim != 2 or pred.shape[1] < 6:
-        raise RuntimeError(f'Unexpected model output shape: {pred.shape}')
-    
-    xywh = pred[:, 0:4].astype(np.float32)
-    num_classes = pred.shape[1] - 4
-    
-    # Handle models with or without objectness score
-    if num_classes >= 20:
-        # No objectness column - class scores start at index 4
-        conf = np.ones((pred.shape[0],), dtype=np.float32)
-        class_scores = pred[:, 4:]
-    else:
-        # Has objectness column
-        conf = pred[:, 4].astype(np.float32)
-        class_scores = pred[:, 5:]
-    
-    class_ids = np.argmax(class_scores, axis=1)
-    class_conf = class_scores[np.arange(class_scores.shape[0]), class_ids]
-    scores = conf * class_conf
-    
-    mask = scores > conf_thres
-    if not np.any(mask):
-        return []
-    
-    xywh = xywh[mask]
-    scores = scores[mask]
-    class_ids = class_ids[mask]
-    
-    # Scale coordinates if normalized
-    if np.max(xywh) <= 1.01:
-        xywh = xywh * float(input_size)
-    
-    boxes = []
-    for x, s, cid in zip(xywh, scores, class_ids):
-        box = xywh2xyxy(x.tolist())
-        boxes.append((box, float(s), int(cid)))
-    return boxes
-
-
-def detect_humans(image, edge_margin=20, debug=False):
-    """Detect humans in an image and return bounding boxes (x, y, w, h) using YOLO ONNX.
-    
-    Args:
-        image: Input image
-        edge_margin: Pixels from edge to filter out partial detections (0 to disable)
-        debug: Print debug information
-    
-    Returns:
-        List of bounding boxes (x, y, w, h) for detected persons fully in frame
-    """
-    sess = _get_yolo_session()
-    input_name = sess.get_inputs()[0].name
-    input_size = 640
-    
-    orig_h, orig_w = image.shape[:2]
-    
-    # Preprocess image
-    img, ratio, (dw, dh) = letterbox(image, new_shape=(input_size, input_size))
-    img = img[:, :, ::-1].astype(np.float32)  # BGR to RGB
-    img = img / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    img = np.expand_dims(img, 0).astype(np.float32)
-    
-    # Run inference
-    outputs = sess.run(None, {input_name: img})
-    
-    # Get prediction output
-    pred = None
-    if isinstance(outputs, list) and len(outputs) == 1:
-        pred = outputs[0]
-    else:
-        for o in outputs:
-            if isinstance(o, np.ndarray) and o.ndim == 3:
-                pred = o
-                break
-    
-    if pred is None:
-        if debug:
-            print("ERROR: No compatible prediction output from model")
-        return []
-    
-    pred = np.asarray(pred)
-    if debug:
-        print(f"Raw prediction shape: {pred.shape}, min: {pred.min():.3f}, max: {pred.max():.3f}")
-    
-    # Lower confidence threshold to catch more detections
-    detections = decode_yolo_output(pred, conf_thres=0.2, input_size=input_size)
-    
-    if debug:
-        print(f"Total detections (all classes): {len(detections)}")
-    
-    # Filter for person class (COCO class 0) and convert to original image coordinates
-    person_boxes = []
-    for box, score, cid in detections:
-        if cid == 0:  # Person class
-            x1, y1, x2, y2 = box
-            # Convert from letterbox coordinates to original image coordinates
-            x1 = (x1 - dw) / ratio
-            x2 = (x2 - dw) / ratio
-            y1 = (y1 - dh) / ratio
-            y2 = (y2 - dh) / ratio
-            x1 = int(max(0, min(orig_w - 1, x1)))
-            x2 = int(max(0, min(orig_w - 1, x2)))
-            y1 = int(max(0, min(orig_h - 1, y1)))
-            y2 = int(max(0, min(orig_h - 1, y2)))
-            
-            if x2 > x1 and y2 > y1:
-                # Convert to (x, y, w, h) format
-                w = x2 - x1
-                h = y2 - y1
-                person_boxes.append(([x1, y1, x2, y2], score))
-    
-    if debug:
-        print(f"Person detections (class 0): {len(person_boxes)}")
-    
-    # Apply NMS
-    if len(person_boxes) > 0:
-        boxes_arr = np.array([p[0] for p in person_boxes])
-        scores_arr = np.array([p[1] for p in person_boxes], dtype=float)
-        keep = nms(boxes_arr, scores_arr, iou_threshold=0.45)
-        final_boxes = boxes_arr[keep]
+    def calculate_quality_score(self, bbox, frame_width, frame_height):
+        """Calculate quality score for PPE detection (0.0 to 1.0)
         
-        if debug:
-            print(f"After NMS: {len(final_boxes)} persons")
+        Prioritizes:
+        - Large bbox (close to camera, more detail for PPE)
+        - Fully in frame (need full body for boots, vests, gloves)
+        - Good aspect ratio (standing person pose)
+        - Centered in frame (better lighting, less distortion)
+        """
+        x, y, w, h = bbox
         
-        # Convert to (x, y, w, h) format and filter edge detections
-        result = []
-        for box in final_boxes:
-            x1, y1, x2, y2 = box
-            x, y, w, h = int(x1), int(y1), int(x2 - x1), int(y2 - y1)
-            
-            # Filter out bboxes at the edge if margin is set
-            if edge_margin > 0:
-                if (x > edge_margin and 
-                    y > edge_margin and 
-                    x + w < orig_w - edge_margin and 
-                    y + h < orig_h - edge_margin):
-                    result.append((x, y, w, h))
-                elif debug:
-                    print(f"Filtered edge detection: bbox({x},{y},{w},{h}) margin={edge_margin} frame({orig_w}x{orig_h})")
-            else:
-                result.append((x, y, w, h))
+        # 1. Size score (40%) - larger is better for PPE detail
+        bbox_area = w * h
+        frame_area = frame_width * frame_height
+        size_ratio = bbox_area / frame_area
+        # Normalize: 0.02 (2% of frame) = 0.0, 0.20 (20% of frame) = 1.0
+        size_score = min(1.0, max(0.0, (size_ratio - 0.02) / 0.18))
         
-        if debug:
-            print(f"Final results after edge filter: {len(result)} persons")
-        return result
+        # 2. Fully in frame score (20%) - critical for full body PPE check
+        margin = 10
+        fully_in_frame = (
+            x >= margin and y >= margin and
+            x + w <= frame_width - margin and y + h <= frame_height - margin
+        )
+        in_frame_score = 1.0 if fully_in_frame else 0.0
+        
+        # 3. Aspect ratio score (20%) - standing person is ~1.5-2.5 H/W
+        aspect_ratio = h / w if w > 0 else 0
+        # Ideal range: 1.5 to 2.5, with peak at 2.0
+        if 1.5 <= aspect_ratio <= 2.5:
+            aspect_score = 1.0 - abs(aspect_ratio - 2.0) / 1.0
+        else:
+            aspect_score = max(0.0, 1.0 - abs(aspect_ratio - 2.0) / 2.0)
+        
+        # 4. Centering score (20%) - center of frame preferred
+        cx = x + w / 2
+        cy = y + h / 2
+        center_x = frame_width / 2
+        center_y = frame_height / 2
+        dx = abs(cx - center_x) / (frame_width / 2)
+        dy = abs(cy - center_y) / (frame_height / 2)
+        centering_score = 1.0 - (dx * 0.6 + dy * 0.4)
+        centering_score = max(0.0, centering_score)
+        
+        # Weighted combination
+        total_score = (
+            size_score * 0.2 +
+            in_frame_score * 0.4 +
+            aspect_score * 0.2 +
+            centering_score * 0.2
+        )
+        
+        return total_score
     
-    if debug:
-        print("No person detections found")
-    return []
+    def update_best_crop(self, object_id, crop, bbox, frame_width, frame_height):
+        """Update best crop if current one is higher quality"""
+        if object_id not in self.best_crops:
+            return
+        
+        quality = self.calculate_quality_score(bbox, frame_width, frame_height)
+        
+        if quality > self.best_crops[object_id]['quality']:
+            self.best_crops[object_id] = {
+                'crop': crop.copy() if crop is not None else None,
+                'quality': quality,
+                'bbox': bbox
+            }
+    
+    def get_best_crop(self, object_id):
+        """Get the best quality crop for an object"""
+        if object_id not in self.best_crops:
+            return None
+        return self.best_crops[object_id]['crop']
 
 
-def crop_person(image, bbox):
-    """Crop person from image given bounding box (x, y, w, h)"""
-    x, y, w, h = bbox
-    x1, y1 = int(x), int(y)
-    x2, y2 = int(x + w), int(y + h)
-    
-    # Ensure bounds are within image
-    h_img, w_img = image.shape[:2]
-    x1 = max(0, min(w_img - 1, x1))
-    x2 = max(0, min(w_img, x2))
-    y1 = max(0, min(h_img - 1, y1))
-    y2 = max(0, min(h_img, y2))
-    
-    if x2 <= x1 or y2 <= y1:
-        return None
-    
-    return image[y1:y2, x1:x2]
-
-
-def identify_humans(frame, edge_margin=0, debug=False):
-    """Detect humans and return bounding boxes"""
-    return detect_humans(frame, edge_margin=edge_margin, debug=debug)
 
