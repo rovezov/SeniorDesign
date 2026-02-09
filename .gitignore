@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# python
+__pycache__/
+*.pyc
+
+# virtual environments
+venv/
+
+# runtime output
+tmp/
+
+# VS Code
+.vscode/

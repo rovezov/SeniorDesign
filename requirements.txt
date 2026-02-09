@@ -1,2 +1,5 @@
 # Add required Python packages here
 
+opencv-python
+numpy
+
