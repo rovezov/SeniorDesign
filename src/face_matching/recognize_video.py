@@ -189,8 +189,7 @@ def match_image_group(image_paths, threshold=100):
         stats = label_stats[best_label]
         overall_confidence = stats["conf_sum"] / stats["count"]
         overall_name = LABEL_MAP.get(best_label, "Unknown")
-        # Require STRICT majority of images to match the chosen label
-        overall_match = (stats["matches"] > (len(image_paths) / 2.0))
+        overall_match = stats["matches"] > 0
 
     return {
         "per_image": per_image,
@@ -203,7 +202,7 @@ def match_image_group(image_paths, threshold=100):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Match cropped face images against trained faces (per-folder labels)."
+        description="Match cropped face images against trained faces and print a single label."
     )
     parser.add_argument("paths", nargs='+', help="One or more image paths, or a single directory of test images")
     parser.add_argument("--threshold", type=float, default=100.0,
@@ -212,45 +211,53 @@ if __name__ == "__main__":
     args = parser.parse_args()
     targets = args.paths
 
+    overall_name = "Unknown"
+
     try:
         # Directory mode: single argument that is a directory
         if len(targets) == 1 and os.path.isdir(targets[0]):
             target = targets[0]
             exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
-            total = 0
-            matched = 0
+            label_counts = {}
             for root, _, files in os.walk(target):
                 for fn in files:
                     if not fn.lower().endswith(exts):
                         continue
                     fp = os.path.join(root, fn)
-                    total += 1
                     try:
                         res = match_face_image(fp, threshold=args.threshold)
                         if res.get("match"):
-                            matched += 1
-                        print(f"{fp} -> {res}")
-                    except Exception as e:
-                        print(f"{fp} -> Error: {e}")
+                            lid = res.get("label_id")
+                            label_counts[lid] = label_counts.get(lid, 0) + 1
+                    except Exception:
+                        # ignore unreadable files or prediction errors
+                        continue
 
-            print(f"\nProcessed {total} images, matches: {matched}")
-        else:
-            # File mode: one or more file paths
-            if len(targets) > 3:
-                print("Error: provide at most 3 image paths when testing a single person")
-                sys.exit(2)
-
-            if len(targets) == 1:
-                result = match_face_image(targets[0], threshold=args.threshold)
-                print(result)
+            if label_counts:
+                # choose label with highest count; tie-breaker: lowest average id (stable)
+                best_label = max(label_counts.items(), key=lambda x: (x[1], -x[0]))[0]
+                overall_name = LABEL_MAP.get(best_label, "Unknown")
             else:
-                # Grouped images (treat as multiple photos of the same test person)
-                res = match_image_group(targets, threshold=args.threshold)
-                # Print per-image followed by overall
-                for p, r in zip(targets, res["per_image"]):
-                    print(f"{p} -> {r}")
-                print("Overall:", res["overall"])
+                overall_name = "Unknown"
+        else:
+            # File mode: one or more file paths (treat multiple as same person group)
+            if len(targets) > 3:
+                overall_name = "Unknown"
+            elif len(targets) == 1:
+                try:
+                    result = match_face_image(targets[0], threshold=args.threshold)
+                    overall_name = result.get("name", "Unknown")
+                except Exception:
+                    overall_name = "Unknown"
+            else:
+                try:
+                    res = match_image_group(targets, threshold=args.threshold)
+                    overall_name = res["overall"].get("name", "Unknown")
+                except Exception:
+                    overall_name = "Unknown"
 
-    except Exception as exc:
-        print(f"Error: {exc}")
-        sys.exit(2)
+    except Exception:
+        overall_name = "Unknown"
+
+    # Final output: single label only
+    print(overall_name)
