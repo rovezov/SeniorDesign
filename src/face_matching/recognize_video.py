@@ -1,111 +1,256 @@
+import argparse
 import cv2
 import os
+import sys
 import numpy as np
-import cvzone
 
-from cvzone.FaceDetectionModule import FaceDetector
+def _find_known_dir():
+    """Find a directory containing training images.
 
-KNOWN_DIR = "known_faces"
+    Tries several common locations so the script works when training
+    data is placed in a sibling `trained_faces` directory or a
+    `known_faces` directory next to this module.
+    """
+    base = os.path.dirname(__file__)
+    candidates = [
+        os.path.join(base, "known_faces"),
+        os.path.join(base, "trained_faces"),
+        os.path.join(base, os.pardir, "trained_faces"),
+        os.path.join(base, os.pardir, os.pardir, "trained_faces"),
+        os.path.join(os.getcwd(), "trained_faces"),
+    ]
+
+    for p in candidates:
+        p = os.path.abspath(p)
+        if os.path.isdir(p):
+            return p
+
+    # If nothing found, raise with helpful diagnostics
+    raise FileNotFoundError(
+        "Known faces directory not found. Tried: " + ", ".join(os.path.abspath(p) for p in candidates)
+    )
+
+KNOWN_DIR = _find_known_dir()
 IMG_SIZE = (200, 200)   # all faces resized to same size for LBPH
 
 
-# -------------------------------------------------------------
-# LOAD TRAINING DATA
-# -------------------------------------------------------------
-print("[INFO] Loading known faces...")
+def _load_training_data():
+    """Load faces from KNOWN_DIR, detect/crop faces in each image and
+    return trained recognizer and label map."""
+    try:
+        from cvzone.FaceDetectionModule import FaceDetector
+    except Exception:
+        FaceDetector = None
 
-faces = []
-labels = []
-label_map = {}  # id → name
-current_label = 0
+    faces = []
+    labels = []
+    label_map = {}
+    current_label = 0
 
-for person_name in os.listdir(KNOWN_DIR):
-    person_path = os.path.join(KNOWN_DIR, person_name)
+    detector = FaceDetector() if FaceDetector is not None else None
 
-    if not os.path.isdir(person_path):
-        continue
+    if not os.path.isdir(KNOWN_DIR):
+        raise FileNotFoundError(f"Known faces directory not found: {KNOWN_DIR}")
 
-    label_map[current_label] = person_name
+    for person_name in os.listdir(KNOWN_DIR):
+        person_path = os.path.join(KNOWN_DIR, person_name)
 
-    for filename in os.listdir(person_path):
-        file_path = os.path.join(person_path, filename)
-        img = cv2.imread(file_path)
-
-        if img is None:
+        if not os.path.isdir(person_path):
             continue
 
-        # Detect + crop face using CVZone’s detector
-        detector = FaceDetector()
-        _, bboxs = detector.findFaces(img, draw=False)
+        label_map[current_label] = person_name
 
-        if bboxs:
-            x, y, w, h = bboxs[0]["bbox"]
-            face_crop = img[y:y+h, x:x+w]
+        for filename in os.listdir(person_path):
+            file_path = os.path.join(person_path, filename)
+            img = cv2.imread(file_path)
 
-            # Normalize & store
+            if img is None:
+                continue
+
+            # If we have a detector, crop the face; otherwise assume image is already a face
+            if detector is not None:
+                _, bboxs = detector.findFaces(img, draw=False)
+                if bboxs:
+                    x, y, w, h = bboxs[0]["bbox"]
+                    face_crop = img[y:y+h, x:x+w]
+                else:
+                    continue
+            else:
+                face_crop = img
+
             gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
             gray = cv2.resize(gray, IMG_SIZE)
 
             faces.append(gray)
             labels.append(current_label)
 
-    current_label += 1
+        current_label += 1
 
-faces = np.array(faces)
-labels = np.array(labels)
+    if not faces:
+        raise ValueError("No training faces found in KNOWN_DIR")
 
-print(f"[INFO] Loaded {len(faces)} face samples.")
+    faces = np.array(faces)
+    labels = np.array(labels)
 
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    recognizer.train(faces, labels)
 
-# -------------------------------------------------------------
-# TRAIN LBPH FACE RECOGNIZER
-# -------------------------------------------------------------
-recognizer = cv2.face.LBPHFaceRecognizer_create()
-recognizer.train(faces, labels)
-
-print("[INFO] Training complete!")
+    return recognizer, label_map
 
 
-# -------------------------------------------------------------
-# WEBCAM RECOGNITION LOOP
-# -------------------------------------------------------------
-cap = cv2.VideoCapture(0)
-detector = FaceDetector()
+# Initialize recognizer at import so the module is ready to match images
+try:
+    recognizer, LABEL_MAP = _load_training_data()
+except Exception as e:
+    recognizer = None
+    LABEL_MAP = {}
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    frame, bboxs = detector.findFaces(frame, draw=False)
+def match_face_image(face_image_path, threshold=100):
+    """Match a single cropped face image file against the trained recognizer.
 
-    for bbox in bboxs:
-        x, y, w, h = bbox["bbox"]
+    Args:
+        face_image_path (str): Path to the cropped face image file.
+        threshold (float): Confidence threshold (lower means better match). Higher
+            values are more permissive (default 100).
 
-        face_crop = frame[y:y+h, x:x+w]
+    Returns:
+        dict: {"label_id": int, "name": str, "confidence": float, "match": bool}
+    """
+    if recognizer is None:
+        raise RuntimeError("Recognizer not initialized. Check training data in KNOWN_DIR.")
 
-        if face_crop.size > 0:
-            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-            gray = cv2.resize(gray, IMG_SIZE)
+    img = cv2.imread(face_image_path)
+    if img is None:
+        raise FileNotFoundError(f"Face image not found: {face_image_path}")
 
-            # Predict identity
-            label_id, confidence = recognizer.predict(gray)
+    # Convert to gray if necessary
+    if len(img.shape) == 3 and img.shape[2] == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
 
-            # Lower confidence = better match
-            if confidence < 70:  # tweak threshold
-                name = label_map.get(label_id, "Unknown")
+    gray = cv2.resize(gray, IMG_SIZE)
+
+    label_id, confidence = recognizer.predict(gray)
+    match = confidence < threshold
+    name = LABEL_MAP.get(label_id, "Unknown") if match else "Unknown"
+
+    return {"label_id": int(label_id), "name": name, "confidence": float(confidence), "match": bool(match)}
+
+
+def match_image_group(image_paths, threshold=100):
+    """Match multiple images (up to 3) that belong to the same test person.
+
+    Returns a dict with per-image results and an overall verdict using a
+    simple majority rule: the label with the most matching images wins; ties
+    resolved by lowest average confidence. If no image produces a match,
+    overall `match` is False.
+    """
+    if not image_paths:
+        raise ValueError("No image paths provided to match_image_group")
+
+    if len(image_paths) > 3:
+        raise ValueError("A maximum of 3 images can be provided for a single test person")
+
+    per_image = []
+    for p in image_paths:
+        res = match_face_image(p, threshold=threshold)
+        per_image.append(res)
+
+    # Count matched labels
+    label_stats = {}
+    for r in per_image:
+        lid = r["label_id"]
+        matched = r["match"]
+        label_stats.setdefault(lid, {"matches": 0, "conf_sum": 0.0, "count": 0})
+        if matched:
+            label_stats[lid]["matches"] += 1
+        label_stats[lid]["conf_sum"] += r["confidence"]
+        label_stats[lid]["count"] += 1
+
+    # Determine best label by most matches then lowest avg confidence
+    best_label = None
+    best_score = None
+    for lid, s in label_stats.items():
+        # Primary key: number of matches (higher is better)
+        # Secondary key: average confidence (lower is better)
+        avg_conf = s["conf_sum"] / s["count"]
+        key = (s["matches"], -avg_conf)
+        if best_score is None or key > best_score:
+            best_score = key
+            best_label = lid
+
+    overall_match = False
+    overall_name = "Unknown"
+    overall_confidence = None
+
+    if best_label is not None:
+        stats = label_stats[best_label]
+        overall_confidence = stats["conf_sum"] / stats["count"]
+        overall_name = LABEL_MAP.get(best_label, "Unknown")
+        # Require STRICT majority of images to match the chosen label
+        overall_match = (stats["matches"] > (len(image_paths) / 2.0))
+
+    return {
+        "per_image": per_image,
+        "overall": {"label_id": int(best_label) if best_label is not None else None,
+                    "name": overall_name,
+                    "confidence": float(overall_confidence) if overall_confidence is not None else None,
+                    "match": bool(overall_match)}
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Match cropped face images against trained faces (per-folder labels)."
+    )
+    parser.add_argument("paths", nargs='+', help="One or more image paths, or a single directory of test images")
+    parser.add_argument("--threshold", type=float, default=100.0,
+                        help="Confidence threshold (lower = stricter). Default: 100")
+
+    args = parser.parse_args()
+    targets = args.paths
+
+    try:
+        # Directory mode: single argument that is a directory
+        if len(targets) == 1 and os.path.isdir(targets[0]):
+            target = targets[0]
+            exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff")
+            total = 0
+            matched = 0
+            for root, _, files in os.walk(target):
+                for fn in files:
+                    if not fn.lower().endswith(exts):
+                        continue
+                    fp = os.path.join(root, fn)
+                    total += 1
+                    try:
+                        res = match_face_image(fp, threshold=args.threshold)
+                        if res.get("match"):
+                            matched += 1
+                        print(f"{fp} -> {res}")
+                    except Exception as e:
+                        print(f"{fp} -> Error: {e}")
+
+            print(f"\nProcessed {total} images, matches: {matched}")
+        else:
+            # File mode: one or more file paths
+            if len(targets) > 3:
+                print("Error: provide at most 3 image paths when testing a single person")
+                sys.exit(2)
+
+            if len(targets) == 1:
+                result = match_face_image(targets[0], threshold=args.threshold)
+                print(result)
             else:
-                name = "Unknown"
+                # Grouped images (treat as multiple photos of the same test person)
+                res = match_image_group(targets, threshold=args.threshold)
+                # Print per-image followed by overall
+                for p, r in zip(targets, res["per_image"]):
+                    print(f"{p} -> {r}")
+                print("Overall:", res["overall"])
 
-            # Draw UI
-            cvzone.cornerRect(frame, (x, y, w, h))
-            cvzone.putTextRect(frame, f"{name} ({int(confidence)})", (x, y - 10),
-                               scale=1, thickness=2)
-
-    cv2.imshow("CVZone Face Recognition (LBPH)", frame)
-
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+    except Exception as exc:
+        print(f"Error: {exc}")
+        sys.exit(2)

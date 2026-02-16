@@ -5,3 +5,5 @@ encodings.pickle
 __pycache__/
 *.pyc
 .DS_Store
+known_faces/Umar_Sheikh
+venv/
