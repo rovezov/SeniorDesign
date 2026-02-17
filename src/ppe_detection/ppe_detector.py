@@ -11,7 +11,19 @@ how is information of the required PPE given?
 how can you flexibly or reliably determine what is the appropriate way a 
 human and an object SHOULD intersect?
 
-PSEUDOCODE: 
+new pseudocode
+    look at list of individuals named
+    also look at list of PPE items identified
+        attempt to map a person to a PPE item. each failure means a flagging of safety violation
+
+
+
+
+
+
+
+
+old pseudocode: 
     given REQUIRED PPE
         scan image for REQUIRED PPE
         if notFound

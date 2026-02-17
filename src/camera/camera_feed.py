@@ -3,12 +3,18 @@
 
 
 import cv2
+import csv
 from pathlib import Path
 import time
 
 from datetime import datetime
 
+'''
 
+note: this code should really be moved in the same file that handles safety violation detection since that
+one needs to also save information for every instance of safety violation
+
+'''
 
 #Daniel: this is just a modification of Ben's risk reduction code. you can cut whatever code is not needed
 #in final project, but you may need the code that helps store locally on rubikPi
@@ -26,6 +32,11 @@ def get_camera_feed():
     warningType="PPE Missing=[X,X,X,X,X]"
     workerName="Responsible Worker= John Smith"
     confidenceNum="Confidence= XX.XX%" 
+
+    
+    data = [
+    {'location': 'not_enabled', 'warning type': '-1', 'worker name': 'unnamed', 'timestamp': 111},
+    ]
 
     while True:
         current_time = time.time() # Get the current time
@@ -45,14 +56,18 @@ def get_camera_feed():
             cv2.imwrite(demoFolder/f"Frame_{timestamp_str}.jpg", frame)
             #append extra information
 
-            extraFilename=f"{timestamp_str}.txt"
+            extraFilename=f"{timestamp_str}.csv"
             extraFile_directory=demoFolder/extraFilename
             
-    
-            with extraFile_directory.open("w") as file_handler:
-                file_handler.write(location+"\n")
-                file_handler.write(warningType+"\n")
-                file_handler.write("proof of time"+timestamp_str)
+            data[0]['timestamp']=timestamp_str #it should in theory always update the timestamp per entry in a csv file
+
+            with open(extraFile_directory, 'a', newline='') as csvfile: #changed w to a to append data per csv file which represents a day
+                fieldnames = ['location', 'warning type', 'worker name', 'confidence', 'timestamp']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
+                if csvfile.tell()==0: #checks if csv file is empty, writes the header only once(at least in theory)
+                    writer.writeheader() 
+                writer.writerows(data)
 
         # Break the loop if 'q' is pressed
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -65,28 +80,11 @@ def get_camera_feed():
 '''
 Notes of Changes
 
--Added Support to save to any kind of folder name
-    Disclaimer: 
-        only implemented such that the saved items are a folder below this code's current path
-        it depends on where the main
+-Added support to contain external data in its own directory
 
-        only a hypothesis, but I think the saving and eventual retrieval of external data depends on where
-        the main python program is location compared to its sub-units
+-each csv file represents a day. each csv file logs all safety violations of that day
 
-        if necessary, you will probably need something like
-            "base=Path.cwd() <--current directory
-            parent=base.parent <--returns parent directory
-
--Added a somewhat rudimentary way of saving information. generates and writes to new text files
-each line containing some kind of external information
-
-I *have* considered the possibility of ZIP files, but with the way information can be broken down into jpgs and 
-text files containing everything else, I don't think compression is strictly necessary
-    I am aware of risks that can arise of converting output into text files
-
-For me, I still have questions about information storage.
-    how does old data get periodically cleared? will this be unecessary when we're just going to upload to some kind of database?
-
-Getting suggestions for .csv format, pickle?(Python thing he said)...
+-this code demonstrates functionality of saving data but has no support being able to take information
+from other modules, only saving dummy data for now
 
 '''
