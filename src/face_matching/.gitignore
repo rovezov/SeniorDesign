@@ -1,9 +1,0 @@
-# Ignore generated encodings file
-encodings.pickle
-
-# Ignore common Python and OS files
-__pycache__/
-*.pyc
-.DS_Store
-known_faces/Umar_Sheikh
-venv/

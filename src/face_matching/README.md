@@ -1,36 +1,36 @@
 Face matching module
 =====================
+Module API (minimal)
+----------
+Import the module and call the minimal functions from Python code. Functions accept in-memory cropped face images (NumPy BGR arrays) and return a simple tuple `(name, confidence)`.
 
-Overview
---------
-This module (`recognize_video.py`) trains an OpenCV LBPH face recognizer from a folder of labeled faces and provides utilities to match test images against the trained model. Each label corresponds to a subfolder containing training images for a single person.
+- `match_face_image(face_image)`
+  - Input: single cropped face image as a NumPy array (BGR). Do not pass a file path.
+  - Output: `(name, confidence)` where `name` is the recognized person's folder name or `None` when not recognized. `confidence` is the LBPH score (lower = more similar).
 
-Training data layout
---------------------
-Place labeled training images in one of these directories (the script will search for them):
+- `match_image_group(images)`
+  - Input: list of 1–3 cropped face images (NumPy arrays, BGR).
+  - Output: `(name, confidence)` with the aggregated decision for the group. `name` is `None` when no match.
 
-- `known_faces/` (next to the module)
-- `trained_faces/` (next to the module or in parent folders)
+Examples (programmatic)
+-----------------------
+```python
+import cv2
+from src.face_matching import recognize_video as rv
 
-Structure example:
+# single image
+img = cv2.imread('test_faces/Lebron_James/lebron-james-10.webp')
+name, conf = rv.match_face_image(img)
+print(name, conf)
 
+# group of multiple cropped faces
+faces = [cv2.imread('img1.jpg'), cv2.imread('img2.jpg')]
+name, conf = rv.match_image_group(faces)
+if name:
+    print('Recognized:', name, 'confidence:', conf)
+else:
+    print('Not recognized')
 ```
-trained_faces/
-  Lebron_James/
-    img1.jpg
-    img2.jpg
-  Stephen_Curry/
-    curry1.jpg
-    curry2.jpg
-```
-
-Notes:
-- Each folder name becomes the human-readable label mapped to a numeric `label_id`.
-- Images should contain face crops if you don't have `cvzone` face detector available. If `cvzone.FaceDetectionModule.FaceDetector` is installed, the module will attempt to detect and crop faces automatically.
-
-Dependencies
-------------
-- Python 3.8+
 - OpenCV with contrib (for `cv2.face.LBPHFaceRecognizer_create`) — install via `pip install opencv-contrib-python`
 - NumPy
 - Optional: `cvzone` for improved face detection (`pip install cvzone`) — if missing the module will still work but expects cropped face images.
