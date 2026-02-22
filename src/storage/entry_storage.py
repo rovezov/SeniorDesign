@@ -19,15 +19,14 @@ def store_entry(entry, savedFrame):
     #cv2.imshow('Original', savedFrame) #Debug only. 
     cv2.imwrite(demoFolder/f"Frame_{timestamp_str}.jpg", savedFrame)
 
-    day_str=current_datetime.strftime("%Y-%m-%d")
-    hours_str=current_datetime.strftime("%H:%M:%S")
+
     extraFilename=f"safety_violation_logs.csv"
     extraFile_directory=demoFolder/extraFilename
             
-    entry[0]['timestamp']=hours_str
+    entry[0]['timestamp']=timestamp_str
 
     with open(extraFile_directory, 'a', newline='') as csvfile:
-        fieldnames = ['location', 'warning type', 'worker name', 'confidence', 'timestamp']
+        fieldnames = ['location', 'worker name', 'confidence', 'timestamp']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
         if csvfile.tell()==0: 
