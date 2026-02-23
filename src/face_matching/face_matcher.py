@@ -36,6 +36,11 @@ class FaceMatcher:
         self.recognizer = None
         self.label_map = {}
         self.known_dir = _find_known_dir()
+        # Try to load existing PKL model, otherwise train and persist one
+        try:
+            self.load_pkl()
+        except Exception:
+            self.train_and_save_pkl()
 
     def _load_training_data(self):
         try:
@@ -97,25 +102,7 @@ class FaceMatcher:
 
         return recognizer, label_map
 
-    def train_and_save(self, model_path=None, labels_path=None):
-        """Train from the known faces directory and save model and label map.
-
-        Defaults: model_path -> <BASE_DIR>/recognizer.yml, labels_path -> <BASE_DIR>/label_map.pkl
-        """
-        if model_path is None:
-            model_path = os.path.join(BASE_DIR, "recognizer.yml")
-        if labels_path is None:
-            labels_path = os.path.join(BASE_DIR, "label_map.pkl")
-
-        recognizer, label_map = self._load_training_data()
-        recognizer.write(model_path)
-        with open(labels_path, "wb") as f:
-            pickle.dump(label_map, f)
-
-        self.recognizer = recognizer
-        self.label_map = label_map
-
-        return model_path, labels_path
+    # NOTE: legacy separate-file save/load removed. Use PKL helpers below.
 
     def train_and_save_pkl(self, pkl_path=None):
         """Train and save a single .pkl containing model bytes and label_map."""
@@ -176,31 +163,13 @@ class FaceMatcher:
         self.label_map = label_map
         return True
 
-    def load(self, model_path=None, labels_path=None):
-        if model_path is None:
-            model_path = os.path.join(BASE_DIR, "recognizer.yml")
-        if labels_path is None:
-            labels_path = os.path.join(BASE_DIR, "label_map.pkl")
-
-        if not os.path.exists(model_path) or not os.path.exists(labels_path):
-            raise FileNotFoundError("Model file or label map not found. Call train_and_save() first.")
-
-        recognizer = cv2.face.LBPHFaceRecognizer_create()
-        recognizer.read(model_path)
-        with open(labels_path, "rb") as f:
-            label_map = pickle.load(f)
-
-        self.recognizer = recognizer
-        self.label_map = label_map
-        return True
-
     def match_face_image(self, face_image):
         """Accept a cropped face image (NumPy BGR) and return (name, confidence).
 
         `name` will be None if no recognizer is loaded.
         """
         if self.recognizer is None:
-            raise RuntimeError("Recognizer not loaded. Call load() or train_and_save() first.")
+            raise RuntimeError("Recognizer not loaded. Call load_pkl() or train_and_save_pkl() first.")
 
         if face_image is None:
             raise ValueError("face_image is None")
