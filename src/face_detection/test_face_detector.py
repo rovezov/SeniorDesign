@@ -1,28 +1,44 @@
 import os
-from face_detector import detect_faces
+import cv2
 
-HERE = os.path.dirname(__file__)
+from face_detector import detect_face
 
-# List of test images
-test_images = [
-    "image1.jpeg",
-    "image2.jpeg",
-    "image3.jpeg"
-]
 
-for i, img_name in enumerate(test_images):
-    person_image = os.path.join(
-        HERE,
-        "face_detection_images",
-        img_name
-    )
+IMAGE_FOLDER = "face_detection_images"
 
-    person_id = i + 1
 
-    print(f"\nTesting image: {img_name}")
+def main():
+    for filename in os.listdir(IMAGE_FOLDER):
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
 
-    faces = detect_faces(person_image, person_id)
+        image_path = os.path.join(IMAGE_FOLDER, filename)
+        print(f"\nProcessing: {filename}")
 
-    print("Detected faces:")
-    for f in faces:
-        print(f)
+        # Load image
+        image = cv2.imread(image_path)
+
+        if image is None:
+            print("Couldn't load image")
+            continue
+
+        face = detect_face(image)
+
+        if face is None:
+            print("No face detected")
+            continue
+
+        print("Face detected!")
+
+        #result
+        cv2.imshow("Original", image)
+        cv2.imshow("Face Crop", face)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+        save_path = os.path.join("face_detection_images", f"croppedFace_{filename}")
+        cv2.imwrite(save_path, face)
+
+
+if __name__ == "__main__":
+    main()

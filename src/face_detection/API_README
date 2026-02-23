@@ -5,85 +5,34 @@ This file explains what each function in `face_detector.py` does, what inputs it
 ---
 
 ## Quick Summary
-- You give this module an image (or a full camera frame + human detection results).
-- It detects a face using OpenCV’s Haar cascade.
-- It saves face crops to disk and returns the file paths.
+- Input: a cropped person image (np.ndarray, BGR format).
+- The module runs OpenCV’s cascade to detect faces.
+- If multiple faces are found, the largest face is selected.
+- Output: a cropped face image (np.ndarray) or None if no face is detected.
 
 ---
 
 ## Functions
 
-## 1) `to_bgr(person_image) -> np.ndarray`
-**Purpose:** Convert whatever you pass in into a BGR OpenCV image.
+## 1) `detect_face(person_bgr: np.ndarray, ...) -> Optional[np.ndarray]`
+**Purpose:** Detect a face inside a cropped person image.
 
-**Accepts:**
-- `str` → image file path
-- `np.ndarray` → BGR image `(H, W, 3)`
-- `dict` → must contain `"image"` or `"crop"` that is a `np.ndarray`
+**Inputs:**
+- person_bgr
+    - type: np.ndarray
+    - format: OpenCV BGR image
+- expected person image from human detection code
 
 **Returns:**
-- `np.ndarray` BGR image `(H, W, 3)`
+- `np.ndarray` → Cropped face image (BGR format)
+- None → If there is no face that's detected
 
-**Common use:** You usually don’t call this directly; the other functions call it for you.
+**Behavior:** 
+- Converts image to grayscale.
+- Runs Haar cascade face detection.
+- If multiple faces are detected, selects the largest (by area).
+- Applies margins
+- Crops and returns the face region.
 
 ---
-
-## 2) `detect_faces(person_image, person_id, ...) -> List[str]`
-**Purpose:** Detect faces in an image and save cropped face images to disk.
-
-**Inputs (main ones):**
-- `person_image`: image input (path / array / dict). See `to_bgr`.
-- `person_id`: used to make a folder `tmp_root/<person_id>/`
-- `tmp_root` (default `"tmp/faces"`): root output folder
-
-**Face crop settings:**
-- `max_faces`: how many faces to process (largest first)
-- `multi_crop_margins`: creates multiple crops with different margins
-- `margin_ratio`: only added if not already in `multi_crop_margins`
-
-**Returns:**
-- `List[str]` → file paths of saved face crops
-
-### Common usage: get exactly 3 face crops (different margins)
-This is what you want if the person is standing still and you want 3 face images:
-
-```python
-paths = detect_faces(
-    person_crop,
-    person_id=pid,
-    max_faces=1,  # only biggest face
-    multi_crop_margins=(0.08, 0.15, 0.25),
-    margin_ratio=0.15,  # keep this in the tuple above so you don't get extra crops
-)
-
-## 3) `detect_faces_from_humans(frame_bgr, human_results, ...) -> List[Dict[str, Any]]`
-**Purpose:** Detect faces in a frame using output from the human detection module by first cropping each person from the full frame and then running `detect_faces()` on that crop.
-
-**Inputs (main ones):**
-- `frame_bgr`: full camera frame (OpenCV BGR image)
-- `human_results`: list of dictionaries from human detection
-- `tmp_root` (default `"tmp/faces"`): root output folder
-- `min_face_size`: minimum face size to detect
-- `max_faces_per_person`: number of faces to process per person (largest first)
-- `multi_crop_margins`: creates multiple crops with different margins
-
-Each person dictionary in `human_results` must include:
-```python
-{
-    "id": int,
-    "bbox": (x, y, w, h)
-}
-
-**Returns:**
-- List[Dict[str, Any]] → list containing each person id and the saved face crop paths
-
-### Common usage: get exactly 3 face crops (different margins)
-results = identification_service.process_frame(frame)
-
-outputs = detect_faces_from_humans(
-    frame,
-    results,
-    max_faces_per_person=1,
-    multi_crop_margins=(0.08, 0.15, 0.25),
-)
 
