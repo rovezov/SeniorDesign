@@ -1,0 +1,38 @@
+# Face Detection API (face_detector.py)
+
+This file explains what each function in `face_detector.py` does, what inputs it expects, and what it returns.
+
+---
+
+## Quick Summary
+- Input: a cropped person image (np.ndarray, BGR format).
+- The module runs OpenCV’s cascade to detect faces.
+- If multiple faces are found, the largest face is selected.
+- Output: a cropped face image (np.ndarray) or None if no face is detected.
+
+---
+
+## Functions
+
+## 1) `detect_face(person_bgr: np.ndarray, ...) -> Optional[np.ndarray]`
+**Purpose:** Detect a face inside a cropped person image.
+
+**Inputs:**
+- person_bgr
+    - type: np.ndarray
+    - format: OpenCV BGR image
+- expected person image from human detection code
+
+**Returns:**
+- `np.ndarray` → Cropped face image (BGR format)
+- None → If there is no face that's detected
+
+**Behavior:** 
+- Converts image to grayscale.
+- Runs Haar cascade face detection.
+- If multiple faces are detected, selects the largest (by area).
+- Applies margins
+- Crops and returns the face region.
+
+---
+
