@@ -24,11 +24,6 @@ def store_entry(entry, savedFrame):
     id_directory=demoFolder/idFilename
     currentID=0
  
-    '''
-    if not os.path.exists(id_directory):
-        pass
-    else:
-    '''
     if os.path.exists(id_directory):
         with open(id_directory, "r") as f:
             content = f.read().strip()
@@ -56,27 +51,3 @@ def store_entry(entry, savedFrame):
             writer.writeheader() 
         writer.writerows(entry) #Incoming data MUST provide values that complies with columns
 
-
-'''
-self note, 'band-aid' a solution to make a unique ID identifier for a row and an image
-let there be a txt file that stores a number. any time data must be saved, open this file, read the number,
-increment the model, then close the file
-
--look, I do not want to do this at start up
-
-    
-    if os.path.exists(id_directory):
-        print("document exists")
-        with open(id_directory, 'r') as file: #this isn't incrementing correctly
-            currentID=int(file.read())
-        
-        nextID=str(currentID+1)
-        with open(id_directory,'w') as nextFile:
-            nextFile.write(nextID)
-    else:
-        print("id doc does not exist")
-        with open(id_directory, 'w') as newfile:
-            newfile.write(str(currentID))
-  
-
-'''
