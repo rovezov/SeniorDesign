@@ -13,12 +13,13 @@ def print_all_logs(h5_path):
     with h5py.File(h5_path, "r") as f:
         logs = f["logs"][:] #<--gives all data for dataset named 'logs'
 
+        #row['name'] MUST be identical to column names in the 'logs' dataset
         for row in logs:
             print(
-                f"ID: {row['uniqueID']} | "
+                f"ID: {row['uniqueID']} | " 
                 f"Location: {row['location']} | "
                 f"Worker: {row['worker_name']} | "
-                f"Confidence: {row['confidence']:.2f} | "
+                f"Confidence: {row['warning_type']} | "
                 f"Time: {row['timestamp']}"
             )
 
@@ -27,6 +28,7 @@ def show_entry(h5_path, uid): #takes entry from both datasets 'logs' and 'images
         log = f["logs"][uid]
         image = f["camera_frames"][str(uid)][:]
 
+    print("===============      Showing Specific Entry      =====================")
     print(log)
     cv2.imshow("Frame", image)
     cv2.waitKey(0)
@@ -58,6 +60,8 @@ if __name__ == "__main__":
 
     #get_logs("storage_demo/safety_logs.h5")
     print_all_logs("storage_demo/safety_logs.h5")
-    #show_entry("storage_demo/safety_logs.h5", 4)
-    #show_all_frames("storage_demo/safety_logs.h5")
+    show_all_frames("storage_demo/safety_logs.h5")
+
+    show_entry("storage_demo/safety_logs.h5", 7)
+
     pass
