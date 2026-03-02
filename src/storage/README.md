@@ -1,11 +1,17 @@
 REQUIRES installation of h5py. Can be achieved with "pip install h5py"
 
 Functions of entry_storage.py:
-        Saves text logs and images into an HDF5 (.h5) file.
+        Saves text logs and images into an HDF5 (.h5) file. Through class called Violation_Entry.
+        
+        The Object created from calling Violation_Entry() has 3 parameters: location, name and warning_type, All of which are strings. If no parameters are given, the object initalizes text entries with default values.
+        
+        Example: store_call=Violation_Entry(location, name,warning_type)
 
-        When called, this function will save a screenshot from the camera that contains a safety violation.
-        It will also save a csv file logging each instance of safety violations for a certain day.
-        The function creates a directory to save entries if it does not exist
+        When constructing the Violation_Entry object, add_entry() is privately called, This function creates or opens a hdf5 file, creates or appends a dataset containing the text portions of the entries named 'logs', and creates or appends to groups hosting different types of images. The logs dataset and image groups share an ID that is automatically incremented, allowing for direct association.
+
+        Note: .add_entry()has commented-out code for add_entry()'s parameters and the code to save other images in preparation for integration with the main demo.
+ 
+        All images sent to .add_entry() must be a numpy.ndarray data type
 
 
 Notes on the HDF5 format:
@@ -29,6 +35,8 @@ Current implementation of the text-only logs uses a variable called 'dt', repres
                         ("timestamp", h5py.string_dtype()),
                 ])
 
+        Note: i8, f4 are analogous to numpy's integer and float types, where the numbers specify bit size
+
         each element of this array must have 1. a field name, 
         2. data type. Strings use string_dtype(), numbers can be represented as integers=i, floats=f. Number after integers or floats indicate bit-limit of those types.
 
@@ -38,17 +46,3 @@ Explanation of this line .create_dataset() from h5py,
         Argument 2: 'size' of the dataset. (0,) indicates an empty dataset. 
         Argument 3:  maxshape=(), specifies limit of dataset's size but can also be set to None
         Argument 4: datatype. can pass a np.dtype variable type here
-
-Demo version of store_entry(entry, savedFrame)
-        "entry": a list of dictionaries. For example: let entry= [{'uniqueID':0,'location': 'not_enabled',  'worker name': 'unnamed', 'confidence':'-1', 'timestamp': 111},
-        ]
-
-        "savedFrame": numpy.ndarray created from cv2
-        Demo does not have other object recognition models supported and can thus only support frames from the camera
-        
-Integration-ready version of store_entry (entry,camFrame,bodyCrop, faceCrop)
-        "entry": a list of dictionaries. For example: [{'uniqueID':0,'location': 'not_enabled',  'worker name': 'unnamed', 'confidence':'-1', 'timestamp': 111},
-        ]
-
-        "savedFrame", "bodyCrop", "faceCrop": expects objects of type numpy.ndarray corresponding to the
-        camera frame, the crop of just the body, and the crop of face resepctively

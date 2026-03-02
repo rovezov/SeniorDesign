@@ -28,10 +28,9 @@ def run_demo(): #purpose, demonstrate a "main" module calling on entry_storage w
         if((current_time - last_capture_time) >= 2): # Executes once every ___ seconds
             last_capture_time = current_time
 
-            #store_call=Violation_Entry("place 1","bob","demo warning") #tests calls to entry_storage with filled inputs
-            store_call=Violation_Entry()
-            store_call.add_entry(frame)
-
+            #store_call=Violation_Entry(frame, "place 1","bob","demo warning") #tests calls to entry_storage with filled inputs
+            store_call=Violation_Entry(frame)
+ 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -40,3 +39,7 @@ def run_demo(): #purpose, demonstrate a "main" module calling on entry_storage w
 if __name__ == "__main__":
     run_demo()
 
+'''
+just a few more changes to make
+
+'''

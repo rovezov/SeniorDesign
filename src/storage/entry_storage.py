@@ -12,15 +12,10 @@ from datetime import datetime
 
 
 class Violation_Entry:
-    
-    def __init__(self, location="unknown", workerName="unidentified", warning="not given"):
-        self.location=location
-        self.workerName=workerName
-        self.warning=warning
 
 
-    def add_entry(self, savedFrame):
-    #def add_entry(self, savedFrame, bodyCrop, faceCrop):
+    def __add_entry(self, savedFrame):
+    #def __add_entry(self, savedFrame, bodyCrop, faceCrop):
         #cv2.imshow('Original', savedFrame) #Debug only.
      
         demoFolder = Path("storage_Demo")
@@ -30,9 +25,12 @@ class Violation_Entry:
         timestamp_str = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
         with h5py.File(h5_path, "a") as f:
-            next_id = f.attrs.get("next_id", 0) #retrieves attribute named next_ID, autoincrements
-            f.attrs["next_id"] = next_id + 1
-            currentID = next_id
+
+            #retrieves attribute named next_ID, autoincrements
+            #1. tries to fetch an attribute called "next_id", returns 0 if attribute does not exist
+            #2. writes back to attribute "next_id" as incremented
+            currentID= f.attrs.get("next_id", 0) 
+            f.attrs["next_id"] =currentID + 1
 
             #If dataset 'logs' does not exist, create dataset.
             if "logs" not in f:
@@ -63,7 +61,7 @@ class Violation_Entry:
             camFrames_group.create_dataset(
                 str(currentID),
                 data=savedFrame,
-                compression="gzip" #<--tells how to compress images
+                compression="gzip" 
             )
             '''
             #re-enable for integration
@@ -81,3 +79,12 @@ class Violation_Entry:
                 compression="gzip" 
             )
             '''
+    
+    def __init__(self, savedFrame, location="unknown", workerName="unidentified", warning="not given"):
+        self.location=location
+        self.workerName=workerName
+        self.warning=warning
+        self.__add_entry(savedFrame)
+
+
+    
