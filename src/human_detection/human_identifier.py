@@ -27,7 +27,7 @@ class HumanIdentificationService:
     - Automatic filtering of edge detections
     """
     
-    def __init__(self, model_path=None, edge_margin=0, min_tracking_time=2.0, 
+    def __init__(self, model_path=None, edge_margin=0, min_tracking_time=0.25, 
                  max_centroid_distance=150, conf_threshold=0.15):
         """
         Initialize the human identification service.
@@ -92,6 +92,7 @@ class HumanIdentificationService:
                 'centroid': tuple(centroid),
                 'bbox': None,
                 'crop': None,
+                'best_crop': None,
                 'ready_to_save': self.tracker.is_ready_to_save(object_id),
                 'tracking_duration': self.tracker.get_tracking_duration(object_id),
                 'is_new': False,
@@ -104,7 +105,9 @@ class HumanIdentificationService:
                     result['bbox'] = (x, y, w, h)
                     crop = self._crop_person(frame, (x, y, w, h))
                     if crop is not None and crop.size > 0:
+                        result['crop'] = crop  # Current frame crop
                         self.tracker.update_best_crop(object_id, crop, (x, y, w, h), frame_w, frame_h)
+                        result['best_crop'] = self.tracker.get_best_crop(object_id)  # Best quality crop
                     break
             
             results.append(result)
@@ -275,6 +278,20 @@ class HumanIdentificationService:
                         })
         return crops_to_save
     
+    def cleanup_departed(self):
+        """
+        Clear all departed person IDs from memory.
+        
+        This should be called periodically for long-running systems to prevent
+        memory growth. Clears the saved_ids set that tracks departed persons.
+        
+        Returns:
+            int: Number of departed IDs that were cleared
+        """
+        count = len(self.saved_ids)
+        self.saved_ids.clear()
+        return count
+    
     def reset(self):
         """Reset tracking state"""
         self.tracker = HumanTracker(
@@ -289,7 +306,7 @@ class HumanIdentificationService:
 class HumanTracker:
     """Tracks humans across frames and assigns persistent IDs"""
     
-    def __init__(self, max_disappeared=10, persistence_window=10, min_tracking_time=2.0, max_centroid_distance=150):
+    def __init__(self, max_disappeared=10, persistence_window=10, min_tracking_time=0.5, max_centroid_distance=150):
         self.next_id = 0
         self.objects = OrderedDict()
         self.disappeared = OrderedDict()
