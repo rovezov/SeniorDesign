@@ -52,7 +52,8 @@ Process a single video frame to detect and track persons.
   - `id` (int): Persistent tracking ID
   - `bbox` (tuple): Bounding box as `(x, y, width, height)` or None if departed
   - `centroid` (tuple): Center point as `(cx, cy)`
-  - `crop` (numpy.ndarray): Cropped person image (only present when `departed=True`)
+  - `crop` (numpy.ndarray): Current frame's cropped person image (None if no bbox)
+  - `best_crop` (numpy.ndarray): Best quality crop accumulated over time (None if no crop yet)
   - `ready_to_save` (bool): True if person has been tracked for minimum time
   - `tracking_duration` (float): Seconds this person has been tracked
   - `is_new` (bool): True if this is a newly saved person (first time returned with crop)
@@ -60,8 +61,11 @@ Process a single video frame to detect and track persons.
 
 **Notes:**
 - Call this method once per frame in your video processing loop
-- Persons with `departed=True` have left the frame and contain their best quality crop
-- Quality selection prioritizes: close-up shots (40%), fully in-frame (20%), standing pose (20%), centered (20%)
+- For currently tracked persons: `crop` provides the current frame crop, `best_crop` provides the highest quality crop
+- For departed persons: `crop` contains the best quality crop saved when they left
+- `crop` field is useful for real-time processing (e.g., face detection on current frame)
+- `best_crop` field is useful for saving high-quality person images
+- Quality selection prioritizes: size (20%), fully in-frame (40%), standing pose (20%), centered (20%)
 
 ---
 
@@ -82,6 +86,23 @@ Retrieve best quality crops for all currently tracked persons. Use when shutting
 - Only returns persons tracked for at least `min_tracking_time` seconds
 - Only returns persons with quality score > 0.3
 - Excludes persons already saved via `process_frame`
+
+---
+
+#### `cleanup_departed()`
+
+Clear all departed person IDs from memory. Use this for long-running systems to prevent memory growth.
+
+**Parameters:** None
+
+**Returns:**
+- `int`: Number of departed IDs that were cleared
+
+**Notes:**
+- Call periodically (e.g., every hour) for 24/7 systems to prevent `saved_ids` set from growing indefinitely
+- Safe to call anytime - does not affect currently tracked persons
+- After calling, departed persons may be saved again if they re-enter the frame (new ID assigned)
+- Recommended for systems running continuously for days/weeks
 
 ---
 
@@ -126,12 +147,19 @@ try:
         for person in results:
             # Save departed persons
             if person['departed'] and person['is_new'] and person['crop'] is not None:
-                filename = f"person_{person['id']}.jpg"
-                cv2.imwrite(filename, person['crop'])
-                print(f"Saved {filename} (quality crop)")
-            
-            # Visualize active tracks
+              Process currently tracked persons
             elif person['bbox'] is not None:
+                # Draw bounding box
+                x, y, w, h = person['bbox']
+                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID: {person['id']}", (x, y-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                
+                # Use current frame crop for real-time processing
+                if person['crop'] is not None:
+                    # Example: run face detection on current crop
+                    # face_detector.detect(person['crop'])
+                    pass
                 x, y, w, h = person['bbox']
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 cv2.putText(frame, f"ID: {person['id']}", (x, y-10),
@@ -158,6 +186,7 @@ finally:
 ```python
 import cv2
 import os
+import time
 from human_identifier import HumanIdentificationService
 
 # Initialize with edge filtering to prevent duplicate IDs at doorways
@@ -172,14 +201,25 @@ os.makedirs(output_dir, exist_ok=True)
 
 cap = cv2.VideoCapture("factory_camera_feed.mp4")
 
+# For long-running systems, periodically clean up departed IDs
+last_cleanup = time.time()
+cleanup_interval = 3600  # 1 hour
+
 while cap.isOpened():
     ret, frame = cap.read()
-    if not ret:
-        break
-    
-    results = service.process_frame(frame)
-    
-    for person in results:
+    if not ret:best quality crop for PPE compliance review
+            filepath = os.path.join(output_dir, f"worker_{person['id']}.jpg")
+            cv2.imwrite(filepath, person['crop'])
+            
+            # Send to PPE detection system
+            # ppe_detector.check_compliance(person['crop'])
+        
+        elif person['bbox'] is not None and person['ready_to_save']:
+            # Process current frame crop in real-time
+            if person['crop'] is not None:
+                # Run real-time analysis on current crop
+                # ppe_detector.check_compliance(person['crop'])
+                pass
         if person['departed'] and person['crop'] is not None:
             # Save for PPE compliance review
             filepath = os.path.join(output_dir, f"worker_{person['id']}.jpg")
@@ -187,6 +227,15 @@ while cap.isOpened():
             
             # Send to PPE detection system
             # ppe_detector.check_compliance(person['crop'])
+    *Size (20%)**: Larger bounding box = closer to camera = more detail visible
+2. **Fully In-Frame (40%)**: Complete body visible (critical for boots, gloves, vest)
+3. **Aspect Ratio (20%)**: Standing person pose (1.5-2.5 height/width ratio)
+4. **Centering (20%)**: Centered in frame = better lighting and less distortion
+
+**Crop Types:**
+- `crop`: Current frame crop - updates every frame, useful for real-time processing (e.g., face detection)
+- `best_crop`: Highest quality crop over time - gradually improves as person moves, best for saving
+        last_cleanup = time.time()
 
 cap.release()
 ```
@@ -195,7 +244,9 @@ cap.release()
 
 The service automatically evaluates each frame and saves the **best quality crop** when a person departs. Quality is scored based on:
 
-1. **Size (40%)**: Larger bounding box = closer to camera = more PPE detail visible
+1. *Long-Running Systems**: Call `cleanup_departed()` periodically (e.g., hourly) to prevent memory growth from departed person IDs
+- ***Size (40%)**: Latwo crops per tracked ID: current frame (~100-500KB) and best crop (~100-500KB)
+- **Long-Running Systems**: Call `cleanup_departed()` periodically (e.g., hourly) to prevent memory growth from departed person IDs PPE detail visible
 2. **Fully In-Frame (20%)**: Complete body visible (critical for boots, gloves, vest)
 3. **Aspect Ratio (20%)**: Standing person pose (1.5-2.5 height/width ratio)
 4. **Centering (20%)**: Centered in frame = better lighting and less distortion

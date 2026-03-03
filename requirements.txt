@@ -1,5 +1,32 @@
-# Add required Python packages here
-opencv-python>=4.5.0
-numpy>=1.21.0
+# Python Package Requirements
+#
+# !! DO NOT run bare: pip install -r requirements.txt !!
+# insightface pulls in albumentations, which installs opencv-python-headless and
+# overwrites the GUI-capable OpenCV, breaking cv2.imshow().
+#
+# Use the provided install script instead:
+#   Windows : .\install.ps1
+#   Linux   : bash install.sh
+#
+# Or manually:
+#   pip install -r requirements.txt
+#   pip install --force-reinstall opencv-contrib-python==4.13.0.92
+
+# Core Dependencies
+numpy>=2.0
 onnxruntime>=1.12.0
 scipy>=1.7.0
+
+# Face Detection/Recognition
+mediapipe==0.10.9
+cvzone>=1.5.0
+# insightface: provides MobileFaceNet/ArcFace ONNX model (buffalo_sc) used by FaceMatcher
+# Windows requires Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+insightface>=0.7.3
+
+# Protobuf (required for mediapipe compatibility)
+protobuf<4,>=3.11
+
+# Computer Vision — listed last so pip resolves it after insightface/albumentations.
+# The force-reinstall in install.ps1 / install.sh ensures headless is removed.
+opencv-contrib-python==4.13.0.92
