@@ -3,9 +3,12 @@ REQUIRES installation of h5py. Can be achieved with "pip install h5py"
 Functions of entry_storage.py:
         Saves text logs and images into an HDF5 (.h5) file. Through class called Violation_Entry.
         
-        The Object created from calling Violation_Entry() has 3 parameters: location, name and warning_type, All of which are strings. If no parameters are given, the object initalizes text entries with default values.
-        
-        Example: store_call=Violation_Entry(location, name,warning_type)
+        In the demo version, the object created from Violation_Entry() has 4 parameters: the camera frame, location, name and warning_type. If location, name and warning type are not specified, they will be written with default values. The file path for the hdf5 log is also initalized
+
+        For the integrated build, the first 3 parameters should be: camera frame, body image and face image. Then the next 3 paramaters are location, name and warning_type.
+
+
+        Example: store_call=Violation_Entry(camFrame, location, name,warning_type)
 
         When constructing the Violation_Entry object, add_entry() is privately called, This function creates or opens a hdf5 file, creates or appends a dataset containing the text portions of the entries named 'logs', and creates or appends to groups hosting different types of images. The logs dataset and image groups share an ID that is automatically incremented, allowing for direct association.
 
@@ -13,6 +16,21 @@ Functions of entry_storage.py:
  
         All images sent to .add_entry() must be a numpy.ndarray data type
 
+
+logsReader.py functions:
+        constructor, __init__(foldername, filename). Uses default folder and file names if not specified upon creating an object
+        
+        get_logs(): only returns text-based logs from dataset 'logs'. Indexes saved as integers. Data returned shows all column values for a given index number
+        
+        print_all_logs(): opens hdf5 file to print all text-based logs
+        
+        get_all_cam_frames(): returns dictionary where key=ID number, value=numpy array representation of an image
+                NOTE: keys are returned as strings, NOT integers
+
+        show_all_came_frames(delay): opens hdf5 file to display all images in cam_frames.
+                delay specifies how long a image stays before moving to the next one
+        show_entry(uid):
+                opens hdf5 file, prints text log and display camera frame given ID number uid
 
 Notes on the HDF5 format:
         The HDF5 format distinguishes 2 main types of objects:

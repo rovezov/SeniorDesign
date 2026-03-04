@@ -15,16 +15,12 @@ class Violation_Entry:
 
 
     def __add_entry(self, savedFrame):
-    #def __add_entry(self, savedFrame, bodyCrop, faceCrop):
+    #def __add_entry(self, savedFrame, bodyCrop, faceCrop): #uncomment when ready to include other images
         #cv2.imshow('Original', savedFrame) #Debug only.
      
-        demoFolder = Path("storage_Demo")
-        demoFolder.mkdir(exist_ok=True)
-
-        h5_path = demoFolder / "safety_logs.h5"
         timestamp_str = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
-        with h5py.File(h5_path, "a") as f:
+        with h5py.File(self.h5_path, "a") as f:
 
             #retrieves attribute named next_ID, autoincrements
             #1. tries to fetch an attribute called "next_id", returns 0 if attribute does not exist
@@ -81,10 +77,13 @@ class Violation_Entry:
             '''
     
     def __init__(self, savedFrame, location="unknown", workerName="unidentified", warning="not given"):
+    #reenable 2nd initializer for saving other image types
+    #def __init__(self, savedFrame, bodyCrop,faceCrop, location="unknown", workerName="unidentified", warning="not given")
         self.location=location
         self.workerName=workerName
         self.warning=warning
+        
+        self.demoFolder=Path("storage_Demo")
+        self.demoFolder.mkdir(exist_ok=True)
+        self.h5_path = self.demoFolder / "safety_logs.h5"
         self.__add_entry(savedFrame)
-
-
-    

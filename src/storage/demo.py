@@ -1,14 +1,6 @@
 import cv2
 import time
-#from entry_storage import store_entry
 
-
-'''
-changes:
-1. remove 'timestamp', readjust code to account for this
-2. make the code object oriented...?
-
-'''
 
 from entry_storage import Violation_Entry
 
