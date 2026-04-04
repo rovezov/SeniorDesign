@@ -79,19 +79,3 @@ class Camera:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
-            
-            
-def main():
-    camera = Camera(fps=15)
-    camera.start_pipeline()
-    i=0
-    
-    for frame in camera.get_frames():
-        filename = f"/home/ubuntu/testing_camera/images/frame_{i}.jpg"
-        cv2.imwrite(filename, frame)
-        print("Saved:", filename)
-        i += 1
-        
-        
-if __name__ == "__main__":
-    main()
