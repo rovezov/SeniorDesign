@@ -1,4 +1,4 @@
-Running python files on Rubik Pi:
+Running python files through UART on Rubik Pi:
 
 1. Open CMD prompt
 2. Navigate to python folder

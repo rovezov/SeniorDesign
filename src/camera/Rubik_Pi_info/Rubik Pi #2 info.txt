@@ -4,4 +4,4 @@ The Rubik Pi box is labeled with a red #2
 username: ubuntu
 password: ottocat
 
-IP address: 192.168.86.22
+IP address: 192.168.86.26
