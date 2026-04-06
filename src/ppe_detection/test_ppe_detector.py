@@ -7,8 +7,8 @@ For each image in test_images/:
   3. Prints a per-image summary, draws annotated bounding boxes in the original
      image coordinate space, and saves annotated_<filename>.jpg.
 
-Usage (from the ppe_detection directory):
-    python test_ppe_detector.py
+Usage (from project root):
+    python src/ppe_detection/test_ppe_detector.py
 
 Optional flags:
     --no-display   Skip cv2.imshow (useful on headless machines).
@@ -23,11 +23,11 @@ import sys
 import cv2
 
 # Allow running from any cwd
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "human_detection"))
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 
-from ppe_detector import PPEDetector
-from human_identifier import HumanIdentificationService
+from src.ppe_detection.ppe_detector import PPEDetector
+from src.human_detection.human_identifier import HumanIdentificationService
 
 
 # ── Colour palette for bounding boxes (BGR) ──────────────────────────────────
@@ -62,6 +62,7 @@ def draw_results(image: "cv2.Mat", result: dict, draw_banner: bool = True) -> "c
         else:
             banner_text = "MISSING: " + ", ".join(result["missing"]).upper()
         h_img = annotated.shape[0]
+        
         cv2.rectangle(annotated, (0, h_img - 36), (annotated.shape[1], h_img), banner_colour, -1)
         cv2.putText(annotated, banner_text, (8, h_img - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -74,7 +75,8 @@ def print_result(filename: str, result: dict) -> None:
     print(f"\n{'─' * 55}")
     print(f"  Image : {filename}")
     print(f"  Status: {'✔  ALL PRESENT' if result['all_present'] else '✘  VIOLATION'}")
-
+    if result["missing"]:
+        print("MISSING: " + ", ".join(result["missing"]).upper())
     if result["detected"]:
         print("  Detected:")
         for det in result["detected"]:
@@ -171,6 +173,7 @@ def main() -> None:
                 })
 
             status = "✔  ALL PRESENT" if result["all_present"] else "✘  VIOLATION"
+            print("MISSING: " + ", ".join(result["missing"]).upper())
             print(f"  Person {person_idx + 1}: {status}")
             if full_detections:
                 for det in full_detections:

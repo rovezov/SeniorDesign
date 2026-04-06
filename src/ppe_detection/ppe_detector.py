@@ -5,6 +5,8 @@ import os
 import cv2
 import numpy as np
 import onnxruntime as ort
+from ..utils.verbose import log
+
 
 
 class PPEDetector:
@@ -24,6 +26,8 @@ class PPEDetector:
     _INPUT_W = 192
     _INPUT_H = 320
 
+    _VALID_LABELS = {"vest", "helmet"}
+
     def __init__(self, requirements: list[str], model_path: str | None = None,
                  conf_threshold: float = 0.3, nms_iou_threshold: float = 0.45):
         """
@@ -36,7 +40,7 @@ class PPEDetector:
             conf_threshold:   Confidence threshold for filtering detections (0-1).
             nms_iou_threshold: IoU threshold used during Non-Maximum Suppression (0-1).
         """
-        self.requirements: set[str] = {item.lower() for item in requirements}
+        self.requirements: set[str] = self._validate_requirements(requirements)
         self.conf_threshold = conf_threshold
         self.nms_iou_threshold = nms_iou_threshold
 
@@ -47,13 +51,8 @@ class PPEDetector:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"PPE model not found at: {model_path}")
 
-        # Load label map from labels.txt next to the model
-        labels_path = os.path.join(os.path.dirname(model_path), "labels.txt")
-        if os.path.exists(labels_path):
-            with open(labels_path) as f:
-                self._labels: list[str] = [line.strip().lower() for line in f if line.strip()]
-        else:
-            self._labels = ["helmet", "vest"]
+        # Load label map [true labels found in labels.txt]
+        self._labels = list(self._VALID_LABELS)
 
         self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self._input_name: str = self._session.get_inputs()[0].name
@@ -85,6 +84,7 @@ class PPEDetector:
 
         for i in range(len(scores_raw)):
             if scores_raw[i] < self.conf_threshold:
+                log("ppe_detection", f"Skipping low-confidence detection: {self._labels[int(class_indices_raw[i])]} with score {scores_raw[i]:.2f}")
                 continue
 
             class_id = int(class_indices_raw[i])
@@ -139,7 +139,18 @@ class PPEDetector:
         Args:
             requirements: New list of required PPE item names.
         """
-        self.requirements = {item.lower() for item in requirements}
+        self.requirements = self._validate_requirements(requirements)
+
+    @classmethod
+    def _validate_requirements(cls, requirements: list[str]) -> set[str]:
+        normalised = {item.lower() for item in requirements}
+        invalid = normalised - cls._VALID_LABELS
+        if invalid:
+            raise ValueError(
+                f"Invalid PPE requirement(s): {sorted(invalid)}. "
+                f"Allowed values: {sorted(cls._VALID_LABELS)}"
+            )
+        return normalised
 
     # ------------------------------------------------------------------
     # Internal helpers
