@@ -1,0 +1,7 @@
+This information is for the Rubik Pi that Ben was working on
+The Rubik Pi box is labeled with a red #2
+
+username: ubuntu
+password: ottocat
+
+IP address: 192.168.86.26

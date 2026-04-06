@@ -1,0 +1,12 @@
+If you have already setup wifi on your Rubik Pi, you just need your Rubik Pi to be powered on and connected to wifi
+
+To determine whether you are succesfully connected to wifi, follow the steps at this link:
+https://www.thundercomm.com/rubik-pi-3/en/docs/rubik-pi-3-user-manual/1.0.0-u/set-up-your-device/
+
+Once connected to wifi, follow these steps to setup SSH to VSCode:
+1.	Click on >< in the bottom left of VSCode
+2.	Click connect to host
+3.	If you need to add a new host, the format is:
+    a.	Ssh <username>@<ip address>
+    b.	Ssh ubuntu@192.168.86.26
+4.	You’ll be prompted to enter your password in the top search bar

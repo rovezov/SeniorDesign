@@ -1,0 +1,7 @@
+Running python files through UART on Rubik Pi:
+
+1. Open CMD prompt
+2. Navigate to python folder
+3. Type: scp ______name of file______ ubuntu@<IP_address>:/home/ubuntu/
+4. Go to PuTTY terminal
+5. Type: python3 /home/ubuntu/______name of file______ 

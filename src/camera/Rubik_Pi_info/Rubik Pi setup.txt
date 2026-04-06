@@ -1,0 +1,17 @@
+1.	Plug in raspberry pi camera
+2.	Plug in micro usb to debug port but not into pc
+3.	Plug in usb c power cord
+4.	Solid green power light should come on
+5.	Dark green debug light should flash once
+    a.	If not, hold power button for a second or two
+6.	Plug usb side of micro usb cord into pc
+7.	Open PuTTY
+8.	Serial
+9.	Correct COM port
+    a.	Check in device manager
+10.	Baud rate to 115200
+    a.	Set matching baud rate in device manager
+
+more information can be found at: 
+https://www.thundercomm.com/rubik-pi-3/en/docs/rubik-pi-3-user-manual/1.0.0-u/set-up-your-device/
+https://www.thundercomm.com/rubik-pi-3/en/docs/rubik-pi-3-user-manual/1.0.0-u/peripherals-and-interfaces/csi/
