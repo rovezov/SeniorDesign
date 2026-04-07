@@ -5,7 +5,7 @@ import os
 import cv2
 import numpy as np
 import onnxruntime as ort
-from ..utils.verbose import log
+from utils.verbose import log
 
 
 

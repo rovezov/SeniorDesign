@@ -1,7 +1,7 @@
 # Verbose / logging flags for each module.
 # Set a module's flag to True to enable its debug output.
 
-VERBOSE                 = True  # Master switch to enable all verbose output. Overrides individual flags below.
+VERBOSE                 = False  # Master switch to enable all verbose output. Overrides individual flags below.
 VERBOSE_CAMERA          = False
 VERBOSE_FACE_DETECTION  = False
 VERBOSE_FACE_MATCHING   = False

@@ -30,7 +30,10 @@ from human_detection.temp_camera import TempCamera
 from human_detection.human_identifier import HumanIdentificationService
 from face_detection.face_detector import detect_face
 from face_matching.face_matcher import FaceMatcher
+from ppe_detection.ppe_detector import PPEDetector
 
+MIN_TIME_BEFORE_TRACKING = 0.5
+PPE_REQUIREMENTS = ['vest']
 
 def _ts() -> str:
     """Current wall-clock time as HH:MM:SS.mmm for log prefixes."""
@@ -46,18 +49,19 @@ def _ts() -> str:
 # is never blocked by heavy ONNX calls.
 
 class FaceWorker:
-    """Runs face detection + matching in a single background thread.
+    """Runs face detection + matching + PPE detection in a single background thread.
 
     Main thread submits (person_id, crop_image) via ``submit()``.
     Results are stored in ``results`` dict keyed by person_id and can be
     polled with ``drain_results()``.
     """
 
-    def __init__(self, face_matcher: FaceMatcher, num_workers: int = 2, maxsize: int = 8):
+    def __init__(self, face_matcher: FaceMatcher, ppe_detector: PPEDetector = None, num_workers: int = 2, maxsize: int = 8):
         self._matcher = face_matcher
+        self._ppe_detector = ppe_detector
         # Bounded queue: if full, main thread skips instead of stacking up work
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
-        self._results: dict = {}   # person_id -> (name, confidence)
+        self._results: dict = {}   # person_id -> (name, confidence, missing_items, all_present)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._pool = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="FaceWorker")
@@ -90,16 +94,32 @@ class FaceWorker:
         self._pool.shutdown(wait=False)
 
     def _process(self, person_id, crop):
-        """Runs in a thread-pool worker: face detect + match."""
+        """Runs in a thread-pool worker: face detect + match + PPE detect."""
+        face_result = (None, None)
+        ppe_result = ([], True)  # (missing_items, all_present)
+        
+        # Downsample crop 2x for faster inference (improves speed ~3-4x)
+        h, w = crop.shape[:2]
+        small_crop = cv2.resize(crop, (w // 2, h // 2)) if h > 50 and w > 50 else crop
+        
         try:
-            face_crop = detect_face(crop)
+            # Face detection and matching
+            face_crop = detect_face(small_crop)
             if face_crop is not None:
                 name, confidence = self._matcher.match_face_image(face_crop)
-                result = (name, confidence)
-            else:
-                result = (None, None)
+                face_result = (name, confidence)
         except Exception:
-            result = (None, None)
+            pass
+        
+        try:
+            # PPE detection
+            if self._ppe_detector is not None:
+                ppe_detection_result = self._ppe_detector.detect(small_crop)
+                ppe_result = (ppe_detection_result['missing'], ppe_detection_result['all_present'])
+        except Exception:
+            pass
+        
+        result = (face_result[0], face_result[1], ppe_result[0], ppe_result[1])
         with self._lock:
             self._results[person_id] = result
 
@@ -118,9 +138,9 @@ class FaceWorker:
 
 
 class PersonTracker:
-    """Tracks person IDs with their identified names using voting"""
+    """Tracks person IDs with their identified names and PPE compliance using voting"""
     
-    def __init__(self, confidence_threshold=0.25, min_votes=2):
+    def __init__(self, confidence_threshold=0.25, min_votes=2, ppe_min_votes=2):
         self.person_votes = {}  # person_id -> {name: [confidences]}
         self.person_names = {}  # person_id -> final decided name
         self.face_attempts = {}  # person_id -> number of face matching attempts
@@ -129,6 +149,11 @@ class PersonTracker:
         # at or above this value are counted (replaces old LBPH "below" logic).
         self.confidence_threshold = confidence_threshold
         self.min_votes = min_votes  # Minimum votes needed to confirm identity
+        
+        # PPE tracking
+        self.ppe_votes = {}  # person_id -> {frozenset(detected_equipment): count}
+        self.ppe_status = {}  # person_id -> {'missing': [items], 'compliant': bool, 'is_non_compliant': bool}
+        self.ppe_min_votes = ppe_min_votes  # Minimum votes for PPE determination
     
     def is_identified(self, person_id):
         """Check if person has been identified with a valid name (not Unknown)"""
@@ -203,6 +228,52 @@ class PersonTracker:
             }
         return stats
     
+    def add_ppe_result(self, person_id, missing_items, all_present):
+        """Add a PPE detection result and update compliance based on voting.
+        
+        Args:
+            person_id: Person tracking ID
+            missing_items: List of missing PPE items (e.g., ['helmet', 'vest'])
+            all_present: Boolean - True if all required PPE is present
+        """
+        if person_id not in self.ppe_votes:
+            self.ppe_votes[person_id] = {}
+        if person_id not in self.ppe_status:
+            self.ppe_status[person_id] = {'missing': [], 'compliant': True, 'is_non_compliant': False}
+        
+        # Store vote as frozenset of missing items for counting
+        missing_key = frozenset(missing_items)
+        self.ppe_votes[person_id][missing_key] = self.ppe_votes[person_id].get(missing_key, 0) + 1
+        
+        # Recalculate best PPE status based on votes
+        votes = self.ppe_votes[person_id]
+        if not votes:
+            return
+        
+        # Find the missing items set with the most votes
+        best_missing_key = max(votes.keys(), key=lambda k: votes[k])
+        best_vote_count = votes[best_missing_key]
+        
+        # Only update if we have enough votes
+        if best_vote_count >= self.ppe_min_votes:
+            best_missing = sorted(list(best_missing_key))
+            is_now_compliant = (len(best_missing) == 0)
+            
+            # Once marked non-compliant, stay non-compliant
+            if not is_now_compliant:
+                self.ppe_status[person_id]['is_non_compliant'] = True
+            
+            self.ppe_status[person_id]['missing'] = best_missing
+            self.ppe_status[person_id]['compliant'] = is_now_compliant
+    
+    def get_ppe_status(self, person_id):
+        """Get PPE compliance status for a person.
+        
+        Returns:
+            Dict with keys: 'missing' (list), 'compliant' (bool), 'is_non_compliant' (bool)
+        """
+        return self.ppe_status.get(person_id, {'missing': [], 'compliant': True, 'is_non_compliant': False})
+    
     def remove_person(self, person_id):
         """Remove person from tracking"""
         if person_id in self.person_names:
@@ -213,9 +284,13 @@ class PersonTracker:
             del self.face_attempts[person_id]
         if person_id in self.last_attempt_time:
             del self.last_attempt_time[person_id]
+        if person_id in self.ppe_votes:
+            del self.ppe_votes[person_id]
+        if person_id in self.ppe_status:
+            del self.ppe_status[person_id]
 
 
-def save_person_info(person_id, name, crop_image, output_dir):
+def save_person_info(person_id, name, crop_image, output_dir, ppe_status=None):
     """
     Save departed person's information
     
@@ -224,46 +299,75 @@ def save_person_info(person_id, name, crop_image, output_dir):
         name: Identified name or "Unknown"
         crop_image: Cropped person image
         output_dir: Directory to save to
+        ppe_status: Dict with PPE compliance info {'missing': [...], 'compliant': bool, 'is_non_compliant': bool}
     
     TODO: Implement actual storage logic (database, CSV, etc.)
     """
-    filename = os.path.join(output_dir, f"person_id_{person_id}_{name}.jpg")
+    if ppe_status is None:
+        ppe_status = {'missing': [], 'compliant': True, 'is_non_compliant': False}
+    
+    # Use name or "unknown_person" if name is Unknown
+    name_part = name if name.lower() != "unknown" else "unknown_person"
+    
+    # Build filename based on compliance status (includes person_id to prevent overwrites)
+    if ppe_status['is_non_compliant']:
+        missing_str = "_".join(ppe_status['missing'])
+        filename = os.path.join(output_dir, f"{name_part}_{person_id}_missing_{missing_str}.jpg")
+        status_str = f"MISSING: {', '.join(ppe_status['missing']).upper()}"
+    else:
+        filename = os.path.join(output_dir, f"{name_part}_{person_id}_compliant.jpg")
+        status_str = "COMPLIANT"
+    
     cv2.imwrite(filename, crop_image)
-    print(f"[SAVE] person_id_{person_id} - Name: {name}")
+    print(f"[SAVE] person_id_{person_id} - Name: {name} - PPE Status: {status_str}")
 
 
-def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
-    """Run integrated human detection, face detection, and face matching demo"""
-    print(f"Starting integrated detection service (Camera {camera_id}, {fps} FPS, Edge margin {edge_margin}px)")
-    print("Initializing face matcher...")
+def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False):
+    """Run integrated human detection, face detection, face matching, and PPE detection demo"""
+    def vprint(*args, **kwargs):
+        """Conditional print based on verbose flag"""
+        if verbose:
+            print(*args, **kwargs)
+    
+    vprint(f"Starting integrated detection service (Camera {camera_id}, {fps} FPS, Edge margin {edge_margin}px)")
+    vprint("Initializing face matcher and PPE detector...")
     
     # Initialize services
     camera = TempCamera(camera_id=camera_id, fps=fps)
     identification_service = HumanIdentificationService(
         edge_margin=edge_margin,
-        min_tracking_time=2.0,
+        min_tracking_time=MIN_TIME_BEFORE_TRACKING,
         max_centroid_distance=150,
         conf_threshold=0.15
     )
     
     face_worker = None
+    ppe_detector = None
+    try:
+        ppe_detector = PPEDetector(requirements=PPE_REQUIREMENTS)
+        vprint("PPE detector initialized successfully")
+    except Exception as e:
+        vprint(f"Warning: PPE detector initialization failed: {e}")
+        vprint("Continuing without PPE detection...")
+        ppe_detector = None
+    
     try:
         face_matcher = FaceMatcher()
-        face_worker = FaceWorker(face_matcher)
-        print("Face matcher initialized successfully")
+        face_worker = FaceWorker(face_matcher, ppe_detector=ppe_detector, num_workers=4, maxsize=5)
+        vprint("Face matcher initialized successfully")
     except Exception as e:
-        print(f"Warning: Face matcher initialization failed: {e}")
-        print("Continuing without face matching...")
+        vprint(f"Warning: Face matcher initialization failed: {e}")
+        vprint("Continuing without face matching...")
         face_matcher = None
     
-    person_tracker = PersonTracker()
+    person_tracker = PersonTracker(confidence_threshold=0.25, min_votes=1, ppe_min_votes=1)
     
     # Track which persons have a face job currently in-flight so we don't
     # queue duplicate jobs before the result comes back.
     in_flight: set = set()
 
-    # Output to human_detection folder
-    output_dir = os.path.join(os.path.dirname(__file__), 'human_detection', 'Output_images')
+    # Output to src/Output folder
+    output_dir = os.path.join(os.path.dirname(__file__), 'Output')
     os.makedirs(output_dir, exist_ok=True)
     
     # Clear previous output images
@@ -279,9 +383,9 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
     cleanup_interval = 3600  # 1 hour
 
     # How long to wait between face-attempt submissions per person (seconds).
-    FACE_COOLDOWN = 0.01
+    FACE_COOLDOWN = 0.75
     
-    print("Press 'q' or ESC to quit")
+    vprint("Press 'q' or ESC to quit")
     
     try:
         camera.start()
@@ -291,18 +395,29 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
             frame_count += 1
 
             # ------------------------------------------------------------------
-            # 1. Drain completed face-recognition results from the worker thread
+            # 1. Drain completed face-recognition and PPE detection results
             # ------------------------------------------------------------------
             if face_worker is not None:
-                for pid, (name, confidence) in face_worker.drain_results().items():
+                for pid, result in face_worker.drain_results().items():
                     in_flight.discard(pid)
+                    name, confidence, missing_items, all_present = result
+                    
+                    # Process face match result
                     if name is not None:
                         was_updated = person_tracker.add_match(pid, name, confidence)
                         if was_updated:
                             final_name = person_tracker.get_name(pid)
                             stats = person_tracker.get_vote_stats(pid)
-                            print(f"[{frame_count}|{_ts()}] ✓ CONFIRMED person {pid} as {final_name}")
-                            print(f"[{frame_count}|{_ts()}]   Vote stats: {stats}")
+                            vprint(f"[{frame_count}|{_ts()}] ✓ CONFIRMED person {pid} as {final_name}")
+                            vprint(f"[{frame_count}|{_ts()}]   Vote stats: {stats}")
+                    
+                    # Process PPE detection result
+                    if missing_items is not None:
+                        person_tracker.add_ppe_result(pid, missing_items, all_present)
+                        ppe_status = person_tracker.get_ppe_status(pid)
+                        if ppe_status['is_non_compliant']:
+                            vprint(f"[{frame_count}|{_ts()}] ⚠ PPE VIOLATION - person {pid} missing: {', '.join(ppe_status['missing'])}")
+                    
                     person_tracker.increment_attempts(pid)
             
             # Process frame through human identification
@@ -319,13 +434,14 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
                     if person['is_new'] and person['crop'] is not None:
                         # Save person information
                         name = person_tracker.get_name(person_id)
-                        save_person_info(person_id, name, person['crop'], output_dir)
+                        ppe_status = person_tracker.get_ppe_status(person_id)
+                        save_person_info(person_id, name, person['crop'], output_dir, ppe_status=ppe_status)
                         
                         # Remove from our tracking
                         person_tracker.remove_person(person_id)
                         in_flight.discard(person_id)
                         
-                        print(f"[{frame_count}|{_ts()}] Person {person_id} departed - Name: {name}")
+                        vprint(f"[{frame_count}|{_ts()}] Person {person_id} departed - Name: {name}")
                         had_departures = True
                     continue
                 
@@ -351,7 +467,7 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
                             if submitted:
                                 in_flight.add(person_id)
                                 attempts = person_tracker.face_attempts.get(person_id, 0) + 1
-                                print(f"[{frame_count}|{_ts()}] Queued face job for person {person_id} (attempt {attempts})")
+                                vprint(f"[{frame_count}|{_ts()}] Queued face job for person {person_id} (attempt {attempts})")
                 
                 # Draw centroid
                 cx, cy = person['centroid']
@@ -366,16 +482,29 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
                 cv2.putText(frame, name, (cx - 10, cy + 20),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 
+                # Draw PPE compliance status
+                ppe_status = person_tracker.get_ppe_status(person_id)
+                if ppe_status['is_non_compliant']:
+                    # Non-compliant: red background with missing items
+                    missing_text = f"MISSING: {','.join(ppe_status['missing']).upper()}"
+                    color = (0, 0, 255)  # Red for non-compliant
+                else:
+                    # Compliant: green
+                    missing_text = "COMPLIANT"
+                    color = (0, 255, 0)  # Green for compliant
+                cv2.putText(frame, missing_text, (cx - 10, cy + 45),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
                 # Draw "TRACKED" status if ready to save
                 if person['ready_to_save']:
-                    cv2.putText(frame, "TRACKED", (cx - 10, cy + 45),
+                    cv2.putText(frame, "TRACKED", (cx - 10, cy + 70),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
             # Clean up departed IDs immediately after processing
             if had_departures:
                 cleared = identification_service.cleanup_departed()
                 if cleared > 0:
-                    print(f"[{frame_count}|{_ts()}] Cleaned up {cleared} departed IDs from memory")
+                    vprint(f"[{frame_count}|{_ts()}] Cleaned up {cleared} departed IDs from memory")
             
             # Calculate FPS
             elapsed = time.time() - t0 or 1e-6
@@ -412,36 +541,39 @@ def run_integrated_demo(camera_id=0, fps=60, duration=None, edge_margin=0):
             # Periodic memory cleanup
             if time.time() - last_cleanup > cleanup_interval:
                 cleared = identification_service.cleanup_departed()
-                print(f"[CLEANUP] Cleared {cleared} departed person IDs from memory")
+                vprint(f"[CLEANUP] Cleared {cleared} departed person IDs from memory")
                 last_cleanup = time.time()
         
         # Handle remaining tracked persons on exit
-        print(f"\nProcessed {frame_count} frames")
+        vprint(f"\nProcessed {frame_count} frames")
         remaining_crops = identification_service.get_all_tracked_crops()
         for person_data in remaining_crops:
             person_id = person_data['id']
             crop = person_data['crop']
             
             name = person_tracker.get_name(person_id)
-            save_person_info(person_id, name, crop, output_dir)
+            ppe_status = person_tracker.get_ppe_status(person_id)
+            save_person_info(person_id, name, crop, output_dir, ppe_status=ppe_status)
             
-            print(f"[EXIT] Saved person_id_{person_id} - Name: {name} (quality {person_data['quality']:.2f})")
+            vprint(f"[EXIT] Saved person_id_{person_id} - Name: {name} (quality {person_data['quality']:.2f})")
         
-        print(f"Total persons saved: {len(identification_service.saved_ids)}")
+        vprint(f"Total persons saved: {len(identification_service.saved_ids)}")
         
     except KeyboardInterrupt:
-        print(f"\n\nInterrupted. Processed {frame_count} frames")
+        vprint(f"\n\nInterrupted. Processed {frame_count} frames")
         # Save remaining on interrupt
         remaining_crops = identification_service.get_all_tracked_crops()
         for person_data in remaining_crops:
             person_id = person_data['id']
             name = person_tracker.get_name(person_id)
-            save_person_info(person_id, name, person_data['crop'], output_dir)
-        print(f"Total persons saved: {len(identification_service.saved_ids)}")
+            ppe_status = person_tracker.get_ppe_status(person_id)
+            save_person_info(person_id, name, person_data['crop'], output_dir, ppe_status=ppe_status)
+        vprint(f"Total persons saved: {len(identification_service.saved_ids)}")
     except Exception as e:
-        print(f"Error: {e}")
+        vprint(f"Error: {e}")
         import traceback
-        traceback.print_exc()
+        if verbose:
+            traceback.print_exc()
     finally:
         if face_worker is not None:
             face_worker.stop()
@@ -459,10 +591,12 @@ def main():
                        help='Duration in seconds (default: indefinite)')
     parser.add_argument('--edge-margin', '-e', type=int, default=0,
                        help='Pixels from edge to filter detections (default: 0)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose output (default: False)')
     
     args = parser.parse_args()
     run_integrated_demo(camera_id=args.camera, fps=args.fps, duration=args.duration, 
-                       edge_margin=args.edge_margin)
+                       edge_margin=args.edge_margin, verbose=args.verbose)
 
 
 if __name__ == '__main__':
