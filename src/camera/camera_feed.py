@@ -1,40 +1,61 @@
 # Camera Feed Module
 # Connects to camera and streams frames
+# Supports both Rubik Pi 3 native camera and standard USB webcams
 
 import cv2
 import time
 
+
 class Camera:
 
-    def __init__(self, camera_id=0, fps=30):
+    def __init__(self, camera_id=0, fps=30, backend='webcam'):
+        """
+        Initialize camera with explicit backend selection.
+        
+        Args:
+            camera_id: Camera device ID
+            fps: Frames per second
+            backend: 'pi' (Rubik Pi 3 camera) or 'webcam' (USB/standard camera). Default: 'webcam'
+        """
         self.camera_id = camera_id
         self.fps = fps
         self.frame_interval = 1.0 / fps
         self.cap = None
+        self.backend = backend
         
+        if backend not in ['pi', 'webcam']:
+            raise ValueError(f"Invalid backend '{backend}'. Must be 'pi' or 'webcam'.")
         
     def start_pipeline(self):
-        """Initialize Raspberry Pi Camera pipeline"""
+        """Initialize camera pipeline (Pi or webcam based on backend selection)"""
         
-        pipeline = (
-            f"qtiqmmfsrc camera={self.camera_id} ! "
-            f"video/x-raw,format=NV12,width=1280,height=720,framerate={self.fps}/1 ! "
-            "videoconvert ! "
-            "appsink drop=true max-buffers=1 sync=false"
-        )
-        self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        if self.backend == 'pi':
+            # Rubik Pi 3 optimized pipeline
+            pipeline = (
+                f"qtiqmmfsrc camera={self.camera_id} ! "
+                f"video/x-raw,format=NV12,width=1280,height=720,framerate={self.fps}/1 ! "
+                "videoconvert ! "
+                "appsink drop=true max-buffers=1 sync=false"
+            )
+            self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+        else:  # webcam
+            # Standard USB/webcam pipeline (works on any OS)
+            self.cap = cv2.VideoCapture(self.camera_id)
         
         if not self.cap.isOpened():
-            raise RuntimeError(f"Failed to open camera {self.camera_id}")
+            raise RuntimeError(f"Failed to open camera {self.camera_id} using backend={self.backend}")
         
         return self
 
+    def start(self):
+        """Alias for start_pipeline() for compatibility with TempCamera"""
+        return self.start_pipeline()
 
     def get_frame(self):
         """Returns a single frame from the pipeline"""
         
         if self.cap is None:
-            raise RuntimeError("Camera not started. Call start_pipeline() first.")
+            raise RuntimeError("Camera not started. Call start_pipeline() or start() first.")
         
         ret, frame = self.cap.read()
         if not ret:
