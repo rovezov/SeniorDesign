@@ -488,3 +488,37 @@ class FaceMatcher:
         if best_sim < threshold:
             return (None, float(best_sim))
         return (best_name, float(best_sim))
+
+    def get_all_match_scores(self, face_image: np.ndarray) -> dict:
+        """Get similarity scores for a face against all known persons (for debugging).
+        
+        Returns dict with all person names and their similarity scores, sorted descending.
+        Useful for understanding why a particular match was selected.
+        
+        Parameters
+        ----------
+        face_image : np.ndarray
+            BGR face crop.
+        
+        Returns
+        -------
+        dict : {person_name: similarity_score, ...}
+            All candidates sorted by score descending.
+        """
+        if face_image is None or not self.embeddings:
+            return {}
+        
+        try:
+            query_emb = self._extract_embedding(face_image)
+            scores = {}
+            
+            # Calculate similarity for each person
+            for person_name, stored_embs in self.embeddings.items():
+                sims = [_cosine_similarity(query_emb, s) for s in stored_embs]
+                best_sim = max(sims) if sims else 0.0
+                scores[person_name] = float(best_sim)
+            
+            # Sort by score descending
+            return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+        except Exception:
+            return {}

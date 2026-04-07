@@ -21,7 +21,7 @@ echo "Logs will be saved to: src/Output/session_log.txt"
 echo ""
 
 echo "Starting pipeline..."
-python ./src/main.py --mode pipeline --fps 60 --camera-backend pi --ppe helmet vest --verbose
+python ./src/main.py --mode pipeline --fps 60 --camera-backend pi --ppe helmet vest
 
 echo ""
 echo "Pipeline stopped."

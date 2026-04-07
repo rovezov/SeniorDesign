@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+
+try:
+    from insightface.app import FaceAnalysis
+except ImportError:
+    raise ImportError("insightface is required for face detection. Install with: pip install insightface>=0.7.3")
 
 #makes sure the cropped image is within the bounds of the original image
 def _clip_box(
@@ -21,25 +25,37 @@ def _clip_box(
     return x, y, w, h
 
 
-# Minimum height (px) the crop is upscaled to before running the cascade.
-# Covers distant persons whose body crop may be only 80-120 px tall.
-_MIN_DETECTION_HEIGHT = 200
+# Initialize insightface RetinaFace detector once at import time
+# Detection plugin provides multi-task learning face detection with landmarks and angles
+_face_detector = None
 
-# Pre-load cascades once at import time (avoid repeated disk I/O per call).
-_CASCADE_FRONTAL = cv2.CascadeClassifier(
-    os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-)
-_CASCADE_PROFILE = cv2.CascadeClassifier(
-    os.path.join(cv2.data.haarcascades, "haarcascade_profileface.xml")
-)
+def _init_detector():
+    """Initialize insightface detector (lazy load)"""
+    global _face_detector
+    if _face_detector is None:
+        _face_detector = FaceAnalysis(name='buffalo_sc', providers=['CPUExecutionProvider'])
+        _face_detector.prepare(ctx_id=-1, det_size=(640, 640))
+    return _face_detector
 
 
 def detect_face(
     person_bgr: np.ndarray,
     min_face_size: Tuple[int, int] = (20, 20),
     margin_ratio: float = 0.15,
-) -> Optional[np.ndarray]: # Returns: a cropped face image or None if no face is detected in the image
+    confidence_threshold: float = 0.5,
+) -> Optional[np.ndarray]:
+    """
+    Detect face in a person crop using insightface RetinaFace detector.
     
+    Args:
+        person_bgr: BGR image array (H, W, 3)
+        min_face_size: Minimum face size (not strictly enforced, for compatibility)
+        margin_ratio: Padding ratio around face bbox (0.0-1.0)
+        confidence_threshold: Detection confidence threshold (0.0-1.0)
+    
+    Returns:
+        Cropped face image or None if no face detected
+    """
     if person_bgr is None or person_bgr.size == 0:
         return None
 
@@ -47,59 +63,47 @@ def detect_face(
         raise ValueError("Expected BGR image with shape (H, W, 3).")
 
     H, W = person_bgr.shape[:2]
-
-    # ── Upscale small / distant crops so the cascade can find tiny faces ──
-    # When a person is far away their bounding-box crop may be only 80-150 px
-    # tall.  A face in that crop can be as small as 15-25 px, which is below
-    # even a (20,20) minSize.  Upscaling to _MIN_DETECTION_HEIGHT keeps the
-    # detection pipeline working at any distances the human detector handles.
-    scale = 1.0
-    work = person_bgr
-    if H < _MIN_DETECTION_HEIGHT:
-        scale = _MIN_DETECTION_HEIGHT / H
-        work = cv2.resize(person_bgr, (int(W * scale), _MIN_DETECTION_HEIGHT),
-                          interpolation=cv2.INTER_LINEAR)
-
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-
-    if _CASCADE_FRONTAL.empty():
-        raise RuntimeError("Failed to load frontal face Haar cascade.")
-
-    def _run_cascade(cascade, gray_img, min_nb):
-        return cascade.detectMultiScale(
-            gray_img,
-            scaleFactor=1.1,    # 1.1 (default) is ~2x faster than 1.05 with minimal accuracy loss
-            minNeighbors=min_nb,
-            minSize=min_face_size,
-            flags=cv2.CASCADE_SCALE_IMAGE,
-        )
-
-    # Try frontal first; fall back to profile for turned heads
-    faces = _run_cascade(_CASCADE_FRONTAL, gray, min_nb=2)
-    if len(faces) == 0 and not _CASCADE_PROFILE.empty():
-        faces = _run_cascade(_CASCADE_PROFILE, gray, min_nb=2)
-
-    if len(faces) == 0:
-        return None
-
-    # Select largest face (in upscaled coordinates)
-    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-
-    # Map coordinates back to original image space
-    if scale != 1.0:
-        x = int(x / scale); y = int(y / scale)
-        w = int(w / scale); h = int(h / scale)
-
-    # Apply margin padding in original space
-    mx = int(w * margin_ratio)
-    my = int(h * margin_ratio)
-
-    x2, y2, w2, h2 = _clip_box(x - mx, y - my, w + 2 * mx, h + 2 * my, W, H)
-
-    face_crop = person_bgr[y2 : y2 + h2, x2 : x2 + w2]
-
-    if face_crop.size == 0:
-        return None
-
-    return face_crop
+    
+    # Convert BGR to RGB for insightface
+    person_rgb = cv2.cvtColor(person_bgr, cv2.COLOR_BGR2RGB)
+    
+    try:
+        detector = _init_detector()
+        # detect() returns list of Face objects with bboxes
+        faces = detector.get(person_rgb)
+        
+        if not faces:
+            return None
+        
+        # Select face with highest confidence
+        best_face = max(faces, key=lambda f: f.det_score)
+        
+        # Skip if confidence is below threshold
+        if best_face.det_score < confidence_threshold:
+            return None
+        
+        # Extract bbox: [x1, y1, x2, y2]
+        bbox = best_face.bbox.astype(int)
+        x, y, x_end, y_end = bbox[0], bbox[1], bbox[2], bbox[3]
+        
+        # Convert to width/height format
+        w = x_end - x
+        h = y_end - y
+        
+        # Apply margin padding
+        mx = int(w * margin_ratio)
+        my = int(h * margin_ratio)
+        
+        # Clip to image bounds
+        x2, y2, w2, h2 = _clip_box(x - mx, y - my, w + 2 * mx, h + 2 * my, W, H)
+        
+        face_crop = person_bgr[y2 : y2 + h2, x2 : x2 + w2]
+        
+        if face_crop.size == 0:
+            return None
+        
+        return face_crop
+        
+    except Exception as e:
+        # Log but don't crash on detector errors
+        raise RuntimeError(f"Face detection failed: {str(e)}")

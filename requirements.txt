@@ -20,7 +20,7 @@ scipy>=1.7.0
 # Face Detection/Recognition
 mediapipe==0.10.9
 cvzone>=1.5.0
-# insightface: provides MobileFaceNet/ArcFace ONNX model (buffalo_sc) used by FaceMatcher
+# insightface: provides RetinaFace detector for face_detector.py + edge-optimized ArcFace (buffalo_sc/MobileFaceNet)
 # Windows requires Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 insightface>=0.7.3
 
