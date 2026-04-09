@@ -1,4 +1,5 @@
 # Python Package Requirements
+# Target runtime: Python 3.12.3
 #
 # !! DO NOT run bare: pip install -r requirements.txt !!
 # insightface pulls in albumentations, which installs opencv-python-headless and
@@ -18,7 +19,8 @@ onnxruntime>=1.12.0
 scipy>=1.7.0
 
 # Face Detection/Recognition
-mediapipe==0.10.9
+# 0.10.9 does not provide Python 3.12 wheels; pin to a 3.12-compatible build.
+mediapipe==0.10.33
 cvzone>=1.5.0
 # insightface: provides RetinaFace detector for face_detector.py + edge-optimized ArcFace (buffalo_sc/MobileFaceNet)
 # Windows requires Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
