@@ -21,8 +21,11 @@ import argparse
 import time
 import os
 import glob
+import tempfile
 import cv2
 import logging
+import traceback
+import threading
 from datetime import datetime
 from camera.camera_feed import Camera
 from detection_pipeline import DetectionPipeline
@@ -34,6 +37,17 @@ def _ts() -> str:
     t = time.localtime()
     ms = int((time.time() % 1) * 1000)
     return f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}.{ms:03d}"
+
+
+def configure_runtime_threads(onnx_threads: int = 1):
+    """Set conservative runtime thread limits for edge stability."""
+    t = str(max(1, int(onnx_threads)))
+    os.environ.setdefault("OMP_NUM_THREADS", t)
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", t)
+    os.environ.setdefault("MKL_NUM_THREADS", t)
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", t)
+    os.environ.setdefault("ORT_INTRA_OP_NUM_THREADS", t)
+    os.environ.setdefault("ORT_INTER_OP_NUM_THREADS", "1")
 
 
 def setup_logging(output_dir):
@@ -75,6 +89,117 @@ def setup_logging(output_dir):
     return log_file
 
 
+def log_runtime_diagnostics(camera_backend, fps):
+    """Log environment details that help diagnose board-side crashes."""
+    try:
+        cv2_path = getattr(cv2, '__file__', 'unknown')
+        build = cv2.getBuildInformation()
+        gst_enabled = 'GStreamer:                   YES' in build
+        ffmpeg_enabled = 'FFMPEG:                      YES' in build
+        logging.info(f"Runtime diagnostics: cv2_version={cv2.__version__}, cv2_path={cv2_path}")
+        logging.info(f"Runtime diagnostics: backend={camera_backend}, requested_fps={fps}, gst_enabled={gst_enabled}, ffmpeg_enabled={ffmpeg_enabled}")
+    except Exception as e:
+        logging.info(f"Runtime diagnostics unavailable: {e}")
+
+
+class RuntimeHealthMonitor:
+    """Periodic runtime telemetry logger for edge diagnostics."""
+
+    def __init__(self, camera, frame_count_getter, interval_sec: float = 1.0):
+        self._camera = camera
+        self._frame_count_getter = frame_count_getter
+        self._interval_sec = max(0.5, float(interval_sec))
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._temp_path = self._discover_temp_path()
+
+    def _discover_temp_path(self):
+        base = "/sys/class/thermal"
+        try:
+            zones = [z for z in os.listdir(base) if z.startswith("thermal_zone")]
+        except Exception:
+            return None
+
+        fallback = None
+        for zone in zones:
+            zone_dir = os.path.join(base, zone)
+            type_path = os.path.join(zone_dir, "type")
+            temp_path = os.path.join(zone_dir, "temp")
+            if not os.path.exists(temp_path):
+                continue
+            if fallback is None:
+                fallback = temp_path
+            try:
+                with open(type_path, "r") as f:
+                    zone_type = f.read().strip().lower()
+                if "cpu" in zone_type:
+                    return temp_path
+            except Exception:
+                continue
+        return fallback
+
+    def _read_cpu_temp_c(self):
+        if not self._temp_path:
+            return None
+        try:
+            with open(self._temp_path, "r") as f:
+                raw = f.read().strip()
+            value = float(raw)
+            return value / 1000.0 if value > 1000 else value
+        except Exception:
+            return None
+
+    def _read_mem_available_mb(self):
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        kb = int(parts[1])
+                        return kb // 1024
+        except Exception:
+            pass
+        return None
+
+    def _log_once(self):
+        frame_count = int(self._frame_count_getter())
+        mem_mb = self._read_mem_available_mb()
+        temp_c = self._read_cpu_temp_c()
+        camera_stats = self._camera.get_health_stats() if self._camera else {}
+
+        mem_str = "NA" if mem_mb is None else str(mem_mb)
+        temp_str = "NA" if temp_c is None else f"{temp_c:.1f}"
+        read_failures = camera_stats.get("read_failures", "NA")
+        consecutive_failures = camera_stats.get("consecutive_read_failures", "NA")
+
+        logging.info(
+            "Health heartbeat: "
+            f"frame={frame_count}, "
+            f"mem_available_mb={mem_str}, "
+            f"cpu_temp_c={temp_str}, "
+            f"camera_read_failures={read_failures}, "
+            f"camera_consecutive_failures={consecutive_failures}"
+        )
+
+    def _run(self):
+        while not self._stop_event.wait(self._interval_sec):
+            self._log_once()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name="RuntimeHealthMonitor")
+        self._thread.start()
+        logging.info("Health monitor started (1s interval)")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        logging.info("Health monitor stopped")
+
+
 def save_person_info(person_id, name, crop_image, output_dir, ppe_status=None):
     """
     Save departed person's information
@@ -101,12 +226,68 @@ def save_person_info(person_id, name, crop_image, output_dir, ppe_status=None):
         filename = os.path.join(output_dir, f"{name_part}_{person_id}_compliant.jpg")
         status_str = "COMPLIANT"
     
-    cv2.imwrite(filename, crop_image)
-    log_msg = f"[SAVE] person_id_{person_id} - Name: {name} - PPE Status: {status_str}"
+    if crop_image is None or getattr(crop_image, "size", 0) == 0:
+        logging.info(f"[SAVE-ERROR] person_id_{person_id} - Empty crop, skipping save")
+        return
+
+    try:
+        saved = _atomic_save_jpeg(filename, crop_image)
+    except Exception as e:
+        logging.info(f"[SAVE-ERROR] person_id_{person_id} - Exception while saving image: {e}")
+        logging.info(traceback.format_exc())
+        return
+
+    if not saved:
+        logging.info(f"[SAVE-ERROR] person_id_{person_id} - Failed to encode/write image")
+        return
+
+    file_size = os.path.getsize(filename) if os.path.exists(filename) else -1
+    if file_size <= 0:
+        logging.info(f"[SAVE-ERROR] person_id_{person_id} - Saved file is empty: {filename}")
+        return
+
+    log_msg = f"[SAVE] person_id_{person_id} - Name: {name} - PPE Status: {status_str} - bytes={file_size}"
     logging.info(log_msg)
 
 
-def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto'):
+def _atomic_save_jpeg(path: str, image, quality: int = 95) -> bool:
+    """Write JPEG via temp file + fsync + atomic rename to avoid zero-byte outputs."""
+    ok, encoded = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        return False
+
+    out_dir = os.path.dirname(path) or '.'
+    os.makedirs(out_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix='.tmp_img_', suffix='.jpg', dir=out_dir)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(encoded.tobytes())
+            f.flush()
+            os.fsync(f.fileno())
+
+        os.replace(tmp_path, path)
+
+        # Best-effort directory fsync so rename is durable after sudden power loss.
+        try:
+            dir_fd = os.open(out_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+
+        return True
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', debug_camera=False, face_workers=1):
     """
     Run detection pipeline without display (ideal for embedded/headless systems)
     
@@ -126,6 +307,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
     # Output directory
     output_dir = os.path.join(os.path.dirname(__file__), 'Output')
     setup_logging(output_dir)
+    log_runtime_diagnostics(camera_backend, fps)
     
     logging.info(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
     vprint(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
@@ -139,7 +321,8 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
         ppe_requirements=ppe_requirements,
         min_tracking_time=0.5,
         edge_margin=edge_margin,
-        verbose=verbose
+        verbose=verbose,
+        face_workers=face_workers,
     )
     
     # Clear previous output images
@@ -152,20 +335,34 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
     frame_count = 0
     last_cleanup = time.time()
     cleanup_interval = 3600  # 1 hour
+    health_monitor = RuntimeHealthMonitor(camera, lambda: frame_count, interval_sec=1.0)
     
     logging.info("Pipeline running... (Press Ctrl+C to stop)")
     vprint("Pipeline running... (Press Ctrl+C to stop)")
     
     try:
+        logging.info("Stage: camera.start begin")
         camera.start()
+        logging.info("Stage: camera.start complete")
+        health_monitor.start()
         
         for frame in camera.get_frames(duration=duration):
             frame_count += 1
+            # print(f"\rProcessing frame {frame_count}...", end='', flush=True)
+            # continue
+            if debug_camera and frame_count % 30 == 0:
+                shape = None if frame is None else tuple(frame.shape)
+                logging.info(f"Debug heartbeat: frame={frame_count}, shape={shape}")
             
             # ------------------------------------------------------------------
             # Process frame through detection pipeline
             # ------------------------------------------------------------------
-            results = pipeline.process_frame(frame)
+            try:
+                results = pipeline.process_frame(frame)
+            except Exception as e:
+                logging.info(f"Stage: pipeline.process_frame failed on frame={frame_count}: {e}")
+                logging.info(traceback.format_exc())
+                raise
             
             # Track if we had any departures in this frame
             had_departures = False
@@ -226,13 +423,17 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
             save_person_info(person_id, name, person_data['crop'], output_dir, ppe_status=ppe_status)
         vprint(f"Total persons saved: {len(pipeline.identification_service.saved_ids)}")
     except Exception as e:
+        logging.info(f"Pipeline exception: {e}")
+        logging.info(traceback.format_exc())
         vprint(f"Error: {e}")
-        import traceback
         if verbose:
             traceback.print_exc()
     finally:
+        logging.info("Stage: cleanup begin")
+        health_monitor.stop()
         pipeline.stop()
         camera.release()
+        logging.info("Stage: cleanup complete")
 
 
 def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto'):
@@ -434,8 +635,13 @@ Examples:
                        help='Enable verbose output (default: False)')
     parser.add_argument('--ppe', type=str, nargs='+', default=['vest'],
                        help='PPE requirements (default: vest)')
+    parser.add_argument('--debug-camera', action='store_true',
+                       help='Enable periodic camera/pipeline heartbeat logging (default: False)')
+    parser.add_argument('--face-workers', type=int, default=1,
+                       help='Background face/PPE worker threads for edge mode (default: 1)')
     
     args = parser.parse_args()
+    configure_runtime_threads(onnx_threads=1)
     
     if args.mode == 'pipeline':
         logging.info(f"Running in PIPELINE mode (no display) with camera backend={args.camera_backend}...")
@@ -447,7 +653,9 @@ Examples:
             edge_margin=args.edge_margin,
             verbose=args.verbose,
             ppe_requirements=args.ppe,
-            camera_backend=args.camera_backend
+            camera_backend=args.camera_backend,
+            debug_camera=args.debug_camera,
+            face_workers=args.face_workers,
         )
     else:  # display mode
         logging.info(f"Running in DISPLAY mode with camera backend={args.camera_backend}...")

@@ -14,21 +14,22 @@
 #   pip install --force-reinstall opencv-contrib-python==4.13.0.92
 
 # Core Dependencies
-numpy>=2.0
+# Pin numpy to 1.x for opencv 4.8.1.78 and mediapipe compatibility
+numpy<2,>=1.21
 onnxruntime>=1.12.0
 scipy>=1.7.0
 
 # Face Detection/Recognition
 # 0.10.9 does not provide Python 3.12 wheels; pin to a 3.12-compatible build.
-mediapipe==0.10.33
 cvzone>=1.5.0
 # insightface: provides RetinaFace detector for face_detector.py + edge-optimized ArcFace (buffalo_sc/MobileFaceNet)
 # Windows requires Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 insightface>=0.7.3
 
 # Protobuf (required for mediapipe compatibility)
-protobuf<4,>=3.11
+protobuf<5,>=4.25.3
 
 # Computer Vision — listed last so pip resolves it after insightface/albumentations.
 # The force-reinstall in install.ps1 / install.sh ensures headless is removed.
-opencv-contrib-python==4.13.0.92
+# Using 4.8.1.78 (compatible with numpy<2) instead of 4.13.0.92 (requires numpy>=2)
+# opencv-contrib-python==4.8.1.78

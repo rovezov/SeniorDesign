@@ -3,7 +3,7 @@
 # Runs the detection pipeline with optimized production settings
 #
 # Usage: bash deploy.sh
-# Configuration: 30 FPS, Rubik Pi 3 camera, helmet + vest detection
+# Configuration: conservative FPS for Rubik Pi 3 stability, helmet + vest detection
 
 echo ""
 echo "========================================"
@@ -21,7 +21,7 @@ echo "Logs will be saved to: src/Output/session_log.txt"
 echo ""
 
 echo "Starting pipeline..."
-python ./src/main.py --mode pipeline --fps 60 --camera-backend pi --ppe helmet vest
+python ./src/main.py --mode pipeline --fps 30 --camera-backend pi --ppe helmet vest --verbose --debug-camera --face-workers 1
 
 echo ""
 echo "Pipeline stopped."

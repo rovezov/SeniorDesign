@@ -1,23 +1,25 @@
 """
-Face matching via deep-learning embeddings (ArcFace / MobileFaceNet).
+Face matching with a lightweight default backend.
 
 Backend priority (first available wins):
-  1. insightface buffalo_l   – ResNet-50, WebFace600K, ~166 MB ONNX
-  2. Raw ONNX session        – place any 112×112 → 512-d ArcFace model at
-                               <module_dir>/arcface.onnx
+        1. OpenCV LBPH recognizer        – ultralight, best for edge stability
+        2. insightface buffalo_sc        – MobileFaceNet (still lightweight)
+        3. Raw ONNX session              – place any 112×112 → 512-d ArcFace model
+                                                                             at <module_dir>/arcface.onnx
 
-Confidence is **cosine similarity** in [0, 1] (higher = better match).
-A value below DEFAULT_THRESHOLD means "not recognised".
+LBPH confidence is mapped to a similarity score in [0, 1] so the public API
+stays consistent with the InsightFace backend.
 
 Public API (backward-compatible with LBPH version):
-  match_face_image(face_image)          → (name, confidence)
-  match_image_group([img, ...])         → (name, confidence)
-  train_and_save_pkl(pkl_path=None)     → pkl_path
-  load_pkl(pkl_path=None)               → True
+    match_face_image(face_image)          → (name, confidence)
+    match_image_group([img, ...])         → (name, confidence)
+    train_and_save_pkl(pkl_path=None)     → pkl_path
+    load_pkl(pkl_path=None)               → True
 """
 
 import os
 import sys
+import math
 import cv2
 import numpy as np
 import pickle
@@ -44,6 +46,9 @@ BASE_DIR = os.path.dirname(__file__)
 # ArcFace / MobileFaceNet standard input size
 _IMG_SIZE = (112, 112)
 
+# LBPH uses a smaller grayscale working size to keep runtime low.
+_LBPH_SIZE = (96, 96)
+
 # Cosine-similarity threshold: raise to be stricter, lower to be more lenient
 DEFAULT_THRESHOLD = 0.25
 
@@ -56,6 +61,12 @@ _CANDIDATE_DIRS = [
 
 # Where the serialised embeddings live
 _EMBEDDINGS_PKL = os.path.join(BASE_DIR, "embeddings.pkl")
+
+# Where the serialised LBPH training data lives
+_LBPH_PKL = os.path.join(BASE_DIR, "lbph_model.pkl")
+
+# Bump this whenever the LBPH training pipeline changes so stale caches rebuild.
+_LBPH_MODEL_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -89,21 +100,31 @@ def _preprocess_onnx(img_bgr: np.ndarray) -> np.ndarray:
     return img
 
 
+def _preprocess_lbph(img_bgr: np.ndarray) -> np.ndarray:
+    """Resize + normalize a BGR face crop for LBPH training / inference."""
+    gray = cv2.cvtColor(cv2.resize(img_bgr, _LBPH_SIZE), cv2.COLOR_BGR2GRAY)
+    return cv2.equalizeHist(gray)
+
+
+def _lbph_distance_to_similarity(distance: float) -> float:
+    """Map LBPH distance to a stable similarity score in [0, 1]."""
+    return float(math.exp(-max(0.0, float(distance)) / 45.0))
+
+
 # ---------------------------------------------------------------------------
 # FaceMatcher
 # ---------------------------------------------------------------------------
 
 class FaceMatcher:
-    """Embedding-based face matcher for edge deployment (RubikPi 3 / QCS6490).
+    """Face matcher for edge deployment (Rubik Pi 3 / QCS6490).
 
-    Uses ArcFace (MobileFaceNet backbone via insightface buffalo_sc **or** a raw
-    ONNX session) to extract 512-d face embeddings, then ranks candidates by
-    cosine similarity.  Far more accurate than LBPH and runs efficiently via
-    ONNX Runtime on-device.
+    The default backend is OpenCV LBPH because it is dramatically lighter than
+    deep embedding inference. If that backend is unavailable, the matcher
+    falls back to insightface buffalo_sc, then to a raw ONNX session.
 
-    Confidence semantics (CHANGED from LBPH version):
+    Confidence semantics:
         confidence ∈ [0, 1]  —  higher means a better match.
-        A result below DEFAULT_THRESHOLD (0.35) is treated as "not recognised".
+        A result below DEFAULT_THRESHOLD is treated as "not recognised".
 
     Usage::
 
@@ -112,23 +133,35 @@ class FaceMatcher:
         name, conf = m.match_image_group([c1, c2]) # up to 3 crops, majority vote
     """
 
-    def __init__(self):
+    def __init__(self, prefer_lightweight: bool = True, use_alignment: bool = False):
         self._mode: str = "none"
         self._session = None           # onnxruntime.InferenceSession (ONNX mode)
         self._input_name: str = ""
         self._rec_model = None         # insightface recognition model
         self._det_model = None         # SCRFD face detector for 5-pt alignment
+        self._lbph_model = None        # OpenCV LBPH face recognizer
+        self._lbph_label_to_name = {}  # label id -> person name
+        self._lbph_name_to_label = {}  # person name -> label id
+        self._lbph_samples_by_person = {}  # person name -> [grayscale face crops]
+        self._prefer_lightweight = bool(prefer_lightweight)
+        self._use_alignment = bool(use_alignment)
         self.embeddings: dict = {}     # {person_name: [np.ndarray(512,), ...]}
         self.known_dir = _find_known_dir()
 
         self._load_model()
 
-        # Try to load cached embeddings; rebuild if stale / missing
+        # Try to load cached training data; rebuild if stale / missing.
         try:
-            self._load_embeddings_pkl()
+            if self._mode == "lbph":
+                self._load_lbph_pkl()
+            else:
+                self._load_embeddings_pkl()
         except Exception:
             try:
-                self._build_and_save_embeddings()
+                if self._mode == "lbph":
+                    self._build_and_save_lbph_model()
+                else:
+                    self._build_and_save_embeddings()
             except Exception:
                 pass  # No training data yet – caller must add faces and retrain
 
@@ -138,47 +171,56 @@ class FaceMatcher:
 
     def _load_model(self):
         """Load best available recognition back-end."""
-        # ── 1. insightface model_zoo – load w600k_mbf directly ──────────────
-        # Prefer this over FaceAnalysis because newer insightface versions key
-        # app.models by filename (e.g. "w600k_mbf") rather than task name
-        # ("recognition"), causing app.models.get("recognition") to return None.
+        # ── 0. OpenCV LBPH – ultralight default on edge devices ─────────────
+        if self._prefer_lightweight and hasattr(cv2, "face") and hasattr(cv2.face, "LBPHFaceRecognizer_create"):
+            try:
+                self._lbph_model = cv2.face.LBPHFaceRecognizer_create(
+                    radius=1,
+                    neighbors=8,
+                    grid_x=8,
+                    grid_y=8,
+                )
+                self._mode = "lbph"
+                return
+            except Exception:
+                self._lbph_model = None
+                self._mode = "none"
+
+        # ── 1. insightface model_zoo – prefer lightweight buffalo_sc ─────────
         try:
             import insightface  # noqa: F401
             from insightface.model_zoo import get_model as _igfz_get_model
 
-            # buffalo_l uses ResNet-50 (w600k_r50.onnx) – much more accurate
-            # than buffalo_sc's MobileFaceNet (w600k_mbf.onnx).
-            _buffalo_dir = os.path.join(
-                os.path.expanduser("~"), ".insightface", "models", "buffalo_l"
-            )
-            _r50_path = os.path.join(_buffalo_dir, "w600k_r50.onnx")
+            model_name = "buffalo_sc" if self._prefer_lightweight else "buffalo_l"
+            rec_file = "w600k_mbf.onnx" if self._prefer_lightweight else "w600k_r50.onnx"
 
-            # Trigger download only when the file is missing
-            if not os.path.exists(_r50_path):
+            _buffalo_dir = os.path.join(
+                os.path.expanduser("~"), ".insightface", "models", model_name
+            )
+            _rec_path = os.path.join(_buffalo_dir, rec_file)
+
+            # Trigger download only when the selected file is missing
+            if not os.path.exists(_rec_path):
                 from insightface.app import FaceAnalysis as _FA
                 _fa = _FA(
-                    name="buffalo_l",
+                    name=model_name,
                     allowed_modules=["recognition"],
                     providers=["CPUExecutionProvider"],
                 )
                 _fa.prepare(ctx_id=-1, det_size=_IMG_SIZE)
 
-            if os.path.exists(_r50_path):
-                rec = _igfz_get_model(_r50_path, providers=["CPUExecutionProvider"])
+            if os.path.exists(_rec_path):
+                rec = _igfz_get_model(_rec_path, providers=["CPUExecutionProvider"])
                 rec.prepare(ctx_id=-1)
                 self._rec_model = rec
                 self._mode = "insightface"
 
-                # Load SCRFD detector for 5-point landmark alignment.
-                # ResNet-50 ArcFace needs aligned crops; without this step
-                # recognition accuracy drops significantly.
-                _det_path = os.path.join(_buffalo_dir, "det_10g.onnx")
-                if os.path.exists(_det_path):
+                # Optional alignment: keep disabled by default for edge stability.
+                _det_path = os.path.join(_buffalo_dir, "det_500m.onnx")
+                if self._use_alignment and os.path.exists(_det_path):
                     try:
                         det = _igfz_get_model(_det_path,
                                               providers=["CPUExecutionProvider"])
-                        # Use a compact input size; the crop is already a tight
-                        # person bbox so 128×128 is sufficient.
                         det.prepare(ctx_id=-1, input_size=(128, 128),
                                     det_thresh=0.4)
                         self._det_model = det
@@ -192,8 +234,9 @@ class FaceMatcher:
         try:
             import insightface  # noqa: F401
             from insightface.app import FaceAnalysis
+            model_name = "buffalo_sc" if self._prefer_lightweight else "buffalo_l"
             app = FaceAnalysis(
-                name="buffalo_l",
+                name=model_name,
                 allowed_modules=["recognition"],
                 providers=["CPUExecutionProvider"],
             )
@@ -224,20 +267,23 @@ class FaceMatcher:
             os.path.join(BASE_DIR, "arcface.onnx"),
             os.path.join(
                 os.path.expanduser("~"),
-                ".insightface", "models", "buffalo_l", "w600k_r50.onnx",
+                ".insightface", "models", "buffalo_sc", "w600k_mbf.onnx",
             ),
-            # Fall back to the smaller model if buffalo_l was never downloaded
             os.path.join(
                 os.path.expanduser("~"),
-                ".insightface", "models", "buffalo_sc", "w600k_mbf.onnx",
+                ".insightface", "models", "buffalo_l", "w600k_r50.onnx",
             ),
         ]
         for onnx_path in _onnx_candidates:
             if os.path.exists(onnx_path):
                 try:
                     import onnxruntime as ort
+                    so = ort.SessionOptions()
+                    so.intra_op_num_threads = 1
+                    so.inter_op_num_threads = 1
                     self._session = ort.InferenceSession(
                         onnx_path,
+                        sess_options=so,
                         providers=["CPUExecutionProvider"],
                     )
                     self._input_name = self._session.get_inputs()[0].name
@@ -252,6 +298,143 @@ class FaceMatcher:
             "Install insightface  OR  place a 112×112→512-d ArcFace ONNX "
             f"model at {onnx_path}."
         )
+
+    def _collect_lbph_training_data(self):
+        """Build training samples for the LBPH backend from known face folders."""
+        if self.known_dir is None:
+            raise FileNotFoundError(
+                "Known faces directory not found. "
+                f"Searched: {', '.join(_CANDIDATE_DIRS)}"
+            )
+
+        try:
+            from face_detection.face_detector import detect_face as _detect_face
+        except ImportError:
+            _detect_face = None
+
+        samples = []
+        labels = []
+        label_to_name = {}
+        name_to_label = {}
+        samples_by_person = {}
+
+        for label_id, person_name in enumerate(sorted(os.listdir(self.known_dir))):
+            person_path = os.path.join(self.known_dir, person_name)
+            if not os.path.isdir(person_path):
+                continue
+
+            person_samples = []
+            for filename in sorted(os.listdir(person_path)):
+                file_path = os.path.join(person_path, filename)
+                img = cv2.imread(file_path)
+                if img is None:
+                    continue
+
+                crop = None
+                if _detect_face is not None:
+                    try:
+                        crop = _detect_face(img)
+                    except Exception:
+                        crop = None
+                if crop is None:
+                    crop = img
+
+                try:
+                    person_samples.append(_preprocess_lbph(crop))
+                except Exception:
+                    continue
+
+            if person_samples:
+                label_to_name[label_id] = person_name
+                name_to_label[person_name] = label_id
+                samples_by_person[person_name] = list(person_samples)
+                for sample in person_samples:
+                    samples.append(sample)
+                    labels.append(label_id)
+
+        if not samples:
+            raise ValueError("No training faces found in known faces directory.")
+
+        return samples, labels, label_to_name, name_to_label, samples_by_person
+
+    def _train_lbph_model(self):
+        """Train the OpenCV LBPH recognizer from known-face images."""
+        if self._lbph_model is None:
+            raise RuntimeError("LBPH recognizer is not available.")
+
+        samples, labels, label_to_name, name_to_label, samples_by_person = self._collect_lbph_training_data()
+        self._lbph_model.train(samples, np.asarray(labels, dtype=np.int32))
+        self._lbph_label_to_name = label_to_name
+        self._lbph_name_to_label = name_to_label
+        self._lbph_samples_by_person = samples_by_person
+        self._mode = "lbph"
+        self.embeddings = {}
+        return samples, labels, label_to_name, name_to_label, samples_by_person
+
+    def _build_and_save_lbph_model(self, pkl_path: str = None) -> str:
+        """Train LBPH and persist the training bundle to pkl."""
+        if pkl_path is None:
+            pkl_path = _LBPH_PKL
+
+        samples, labels, label_to_name, name_to_label, samples_by_person = self._train_lbph_model()
+        with open(pkl_path, "wb") as fh:
+            pickle.dump(
+                {
+                    "backend": "lbph",
+                    "version": _LBPH_MODEL_VERSION,
+                    "samples": samples,
+                    "labels": labels,
+                    "label_to_name": label_to_name,
+                    "name_to_label": name_to_label,
+                    "samples_by_person": samples_by_person,
+                    "size": _LBPH_SIZE,
+                },
+                fh,
+            )
+        return pkl_path
+
+    def _load_lbph_pkl(self, pkl_path: str = None) -> bool:
+        """Load LBPH training data from pkl and retrain the recognizer."""
+        if pkl_path is None:
+            pkl_path = _LBPH_PKL
+
+        if not os.path.exists(pkl_path):
+            raise FileNotFoundError(f"LBPH pkl not found: {pkl_path}")
+
+        with open(pkl_path, "rb") as fh:
+            data = pickle.load(fh)
+
+        if not isinstance(data, dict) or data.get("backend") != "lbph":
+            raise ValueError("Unrecognised LBPH pkl format.")
+
+        if data.get("version") != _LBPH_MODEL_VERSION:
+            raise ValueError("Stale LBPH pkl format – retrain required.")
+
+        samples = data.get("samples", [])
+        labels = data.get("labels", [])
+        label_to_name = data.get("label_to_name", {})
+        name_to_label = data.get("name_to_label", {})
+        samples_by_person = data.get("samples_by_person", {})
+
+        if not samples_by_person and samples and labels and label_to_name:
+            reconstructed = {}
+            for sample, label_id in zip(samples, labels):
+                person_name = label_to_name.get(int(label_id))
+                if person_name is None:
+                    continue
+                reconstructed.setdefault(person_name, []).append(sample)
+            samples_by_person = reconstructed
+
+        if self._lbph_model is None:
+            raise RuntimeError("LBPH recognizer is not available.")
+
+        self._lbph_model.train(samples, np.asarray(labels, dtype=np.int32))
+        self._lbph_label_to_name = label_to_name
+        self._lbph_name_to_label = name_to_label
+        self._lbph_samples_by_person = samples_by_person
+        self._mode = "lbph"
+        self.embeddings = {}
+        return True
 
     # ------------------------------------------------------------------
     # Embedding extraction
@@ -370,6 +553,8 @@ class FaceMatcher:
     # Public alias (backward-compatible name)
     def train_and_save_pkl(self, pkl_path: str = None) -> str:
         """Build embeddings from known faces and persist to pkl. Returns pkl path."""
+        if self._mode == "lbph":
+            return self._build_and_save_lbph_model(pkl_path)
         return self._build_and_save_embeddings(pkl_path)
 
     def _load_embeddings_pkl(self, pkl_path: str = None) -> bool:
@@ -395,6 +580,8 @@ class FaceMatcher:
     # Public alias (backward-compatible name)
     def load_pkl(self, pkl_path: str = None) -> bool:
         """Load serialised embeddings from pkl. Returns True on success."""
+        if self._mode == "lbph":
+            return self._load_lbph_pkl(pkl_path)
         return self._load_embeddings_pkl(pkl_path)
 
     # ------------------------------------------------------------------
@@ -420,6 +607,10 @@ class FaceMatcher:
         """
         if face_image is None:
             raise ValueError("face_image is None.")
+        if self._mode == "lbph":
+            effective_threshold = min(float(threshold), 0.18)
+            return self._match_face_image_lbph(face_image, effective_threshold)
+
         if not self.embeddings:
             raise RuntimeError(
                 "No embeddings loaded. Call train_and_save_pkl() first."
@@ -447,6 +638,9 @@ class FaceMatcher:
             raise ValueError("No images provided to match_image_group.")
         if len(images) > 3:
             raise ValueError("A maximum of 3 images can be provided.")
+
+        if self._mode == "lbph":
+            return self._match_image_group_lbph(images, threshold)
 
         query_embs = []
         for img in images:
@@ -489,6 +683,68 @@ class FaceMatcher:
             return (None, float(best_sim))
         return (best_name, float(best_sim))
 
+    def _match_face_image_lbph(self, face_image: np.ndarray, threshold: float):
+        """Match a single face image using the OpenCV LBPH backend."""
+        scores = self._score_all_lbph_candidates(face_image)
+        if not scores:
+            return (None, None)
+
+        best_name = next(iter(scores))
+        best_confidence = float(scores[best_name])
+        if best_confidence < threshold:
+            return (None, best_confidence)
+        return (best_name, best_confidence)
+
+    def _match_image_group_lbph(self, images: list, threshold: float):
+        """Match a small group of images using repeated LBPH predictions."""
+        scores = {}
+        votes = {}
+
+        for image in images:
+            if image is None:
+                continue
+            try:
+                name, confidence = self._match_face_image_lbph(image, threshold)
+            except Exception:
+                continue
+            if name is None:
+                continue
+            scores[name] = max(scores.get(name, 0.0), confidence)
+            votes[name] = votes.get(name, 0) + 1
+
+        if not scores:
+            return (None, None)
+
+        best_name = max(scores, key=lambda candidate: (votes.get(candidate, 0), scores[candidate]))
+        return (best_name, float(scores[best_name]))
+
+    def _score_all_lbph_candidates(self, face_image: np.ndarray) -> dict:
+        """Score a face image against every trained LBPH identity."""
+        if self._lbph_model is None:
+            raise RuntimeError("LBPH recognizer is not loaded.")
+        if face_image is None or not self._lbph_samples_by_person:
+            return {}
+
+        query_face = _preprocess_lbph(face_image)
+        scores = {}
+        for person_name, stored_faces in self._lbph_samples_by_person.items():
+            if not stored_faces:
+                continue
+            best_sim = max(
+                self._score_lbph_against_person(query_face, stored_face)
+                for stored_face in stored_faces
+            )
+            scores[person_name] = float(best_sim)
+
+        return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+
+    def _score_lbph_against_person(self, query_face: np.ndarray, stored_face: np.ndarray) -> float:
+        """Cheap similarity score between two preprocessed LBPH face crops."""
+        q = query_face.astype(np.float32)
+        s = stored_face.astype(np.float32)
+        diff = cv2.norm(q, s, cv2.NORM_L2)
+        return float(math.exp(-diff / 4000.0))
+
     def get_all_match_scores(self, face_image: np.ndarray) -> dict:
         """Get similarity scores for a face against all known persons (for debugging).
         
@@ -505,10 +761,16 @@ class FaceMatcher:
         dict : {person_name: similarity_score, ...}
             All candidates sorted by score descending.
         """
-        if face_image is None or not self.embeddings:
+        if face_image is None:
             return {}
         
         try:
+            if self._mode == "lbph":
+                return self._score_all_lbph_candidates(face_image)
+
+            if not self.embeddings:
+                return {}
+
             query_emb = self._extract_embedding(face_image)
             scores = {}
             

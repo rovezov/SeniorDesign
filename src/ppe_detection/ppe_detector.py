@@ -54,7 +54,10 @@ class PPEDetector:
         # Load label map [true labels found in labels.txt]
         self._labels = list(self._VALID_LABELS)
 
-        self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(model_path, sess_options=so, providers=["CPUExecutionProvider"])
         self._input_name: str = self._session.get_inputs()[0].name
 
     # ------------------------------------------------------------------

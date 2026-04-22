@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
 # install.sh — Linux/RubikPi setup script
-# Handles the opencv-python-headless conflict introduced by insightface/albumentations.
+# Avoids leaving conflicting OpenCV wheels installed after dependency setup.
 #
 # Usage: bash install.sh
 
 set -e
 
 echo "Installing requirements..."
-python -m pip install -r requirements.txt
+python -m pip install --break-system-packages -r requirements.txt
 
 echo ""
-echo "Force-reinstalling full OpenCV (removes headless version if present)..."
-python -m pip uninstall opencv-python-headless -y 2>/dev/null || true
-python -m pip install --force-reinstall opencv-contrib-python==4.13.0.92
+echo "Removing OpenCV wheel variants that can conflict with the system cv2 build..."
+python -m pip uninstall --break-system-packages -y opencv-contrib-python opencv-contrib-python-headless opencv-python opencv-python-headless 2>/dev/null || true
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════╗"

@@ -30,11 +30,12 @@ class FaceWorker:
     polled with ``drain_results()``.
     """
 
-    def __init__(self, face_matcher, ppe_detector: PPEDetector = None, num_workers: int = 2, maxsize: int = 8, verbose: bool = False, session_logger=None):
+    def __init__(self, face_matcher, ppe_detector: PPEDetector = None, num_workers: int = 2, maxsize: int = 8, verbose: bool = False, session_logger=None, enable_face_matching: bool = True):
         self._matcher = face_matcher
         self._ppe_detector = ppe_detector
         self._verbose = verbose
         self._session_logger = session_logger
+        self._enable_face_matching = bool(enable_face_matching)
         # Bounded queue: if full, main thread skips instead of stacking up work
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
         self._results: dict = {}   # person_id -> (name, confidence, missing_items, all_present)
@@ -84,7 +85,8 @@ class FaceWorker:
             # Create a small dummy image (480x360)
             dummy_crop = np.zeros((360, 480, 3), dtype=np.uint8)
             # Run one inference through the pipeline to warm up all models
-            self._process(person_id=-1, crop=dummy_crop)
+            warmup_job = 'face+ppe' if (self._enable_face_matching and self._matcher is not None) else 'ppe'
+            self._process(person_id=-1, crop=dummy_crop, job_type=warmup_job)
             # Drain the result so it doesn't pollute actual results
             with self._lock:
                 self._results.clear()
@@ -104,7 +106,7 @@ class FaceWorker:
         ppe_result = ([], True)  # (missing_items, all_present)
         
         # Process face detection/matching if requested
-        if job_type in ['face+ppe', 'face']:
+        if job_type in ['face+ppe', 'face'] and self._enable_face_matching and self._matcher is not None:
             try:
                 # Face detection using insightface RetinaFace (robust to various angles and scales)
                 if self._session_logger:
@@ -351,7 +353,7 @@ class DetectionPipeline:
     
     SESSION_LOG_PATH = "src/Output/session_log.txt"
     
-    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.25, ppe_confidence_threshold=0.75):
+    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.17, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True):
         """
         Initialize the detection pipeline.
         
@@ -360,11 +362,13 @@ class DetectionPipeline:
             min_tracking_time: Minimum time before a person is tracked (seconds)
             edge_margin: Pixels from edge to filter detections
             verbose: Enable verbose logging
-            face_confidence_threshold: Confidence threshold for face matching (0-1, default 0.25)
+            face_confidence_threshold: Confidence threshold for face matching (0-1, default 0.17)
             ppe_confidence_threshold: Confidence threshold for PPE detection (0-1, default 0.75)
         """
         self.verbose = verbose
         self.ppe_requirements = ppe_requirements or []
+        self.face_workers = max(1, int(face_workers))
+        self.enable_face_matching = bool(enable_face_matching)
         self._log_lock = threading.Lock()
         
         # Clear and initialize session log
@@ -394,7 +398,14 @@ class DetectionPipeline:
         )
         self.in_flight = set()  # Tracks person IDs with pending face detection jobs
         self.ppe_processed = set()  # Tracks person IDs that have completed PPE detection
-        self.face_cooldown = 0.05  # Reduced for faster edge detection
+        self.face_cooldown = 1.0  # Increased from 0.05 to further reduce CPU load and thermal stress
+        
+        # Thermal throttling: pause face detection if CPU overheats
+        self._thermal_throttled = False
+        self._temp_override_threshold = 75.0  # Celsius - pause submissions above this
+        self._temp_resume_threshold = 60.0   # Celsius - resume below this
+        self._face_matching_disabled = False  # Permanently disable if CPU reaches critical temp
+        self._critical_temp_threshold = 80.0  # Celsius - hard disable face matching above this
     
     def _init_ppe_detector(self):
         """Initialize PPE detector"""
@@ -408,15 +419,34 @@ class DetectionPipeline:
             self.ppe_detector = None
     
     def _init_face_worker(self):
-        """Initialize face worker with insightface FaceMatcher (edge-optimized buffalo_sc)"""
+        """Initialize face worker with an ultralight face matcher."""
         try:
-            self._vprint("Initializing face detection models and warming up...")
-            self._log("Initializing face detection models and warming up...")
-            face_matcher = FaceMatcher()
-            # 4 workers and maxsize=10 for optimal edge device performance
-            self.face_worker = FaceWorker(face_matcher, ppe_detector=self.ppe_detector, num_workers=4, maxsize=10, verbose=self.verbose, session_logger=self._log)
-            self._vprint("Face detection models initialized and warmed up successfully")
-            self._log("Face detection models initialized and warmed up successfully")
+            self._vprint("Initializing face/PPE worker and warming up...")
+            self._log("Initializing face/PPE worker and warming up...")
+            # Default to the ultralight OpenCV LBPH backend, with InsightFace as fallback.
+            face_matcher = FaceMatcher(prefer_lightweight=True, use_alignment=False) if self.enable_face_matching else None
+            if not self.enable_face_matching:
+                self._log("Face matching is DISABLED for this run; identities will remain Unknown")
+            else:
+                backend_name = getattr(face_matcher, "_mode", "unknown") if face_matcher is not None else "unknown"
+                if backend_name == "lbph":
+                    self._log("Face matching is ENABLED in ultralight LBPH mode (OpenCV Haar cascade + LBPH recognizer)")
+                elif backend_name == "insightface":
+                    self._log("Face matching is ENABLED in lightweight InsightFace mode (buffalo_sc, alignment disabled)")
+                else:
+                    self._log("Face matching is ENABLED with an unknown backend selection")
+            # Keep worker count conservative on embedded systems to reduce CPU pressure.
+            self.face_worker = FaceWorker(
+                face_matcher,
+                ppe_detector=self.ppe_detector,
+                num_workers=self.face_workers,
+                maxsize=6,
+                verbose=self.verbose,
+                session_logger=self._log,
+                enable_face_matching=self.enable_face_matching,
+            )
+            self._vprint("Face/PPE worker initialized and warmed up successfully")
+            self._log("Face/PPE worker initialized and warmed up successfully")
         except Exception as e:
             self._vprint(f"Warning: Face matcher initialization failed: {e}")
             self._log(f"Warning: Face matcher initialization failed: {e}")
@@ -450,6 +480,31 @@ class DetectionPipeline:
         if self.verbose:
             print(*args, **kwargs)
     
+    def _check_and_update_thermal_throttle(self):
+        """Check CPU temperature and update thermal throttle state."""
+        try:
+            temp_path = "/sys/class/thermal/thermal_zone0/temp"
+            with open(temp_path, "r") as f:
+                raw = f.read().strip()
+            temp_c = float(raw) / 1000.0 if float(raw) > 1000 else float(raw)
+            
+            # CRITICAL: Hard disable face matching if temperature exceeds safety threshold
+            if not self._face_matching_disabled and temp_c >= self._critical_temp_threshold:
+                self._face_matching_disabled = True
+                self._thermal_throttled = True
+                self._log(f"CRITICAL THERMAL: Permanently disabled face matching (temp={temp_c:.1f}°C >= {self._critical_temp_threshold}°C)")
+                return
+            
+            # Normal throttling logic (only if not critically disabled)
+            if self._thermal_throttled and temp_c < self._temp_resume_threshold:
+                self._thermal_throttled = False
+                self._log(f"Thermal: Resumed face detection (temp={temp_c:.1f}°C)")
+            elif not self._thermal_throttled and temp_c > self._temp_override_threshold:
+                self._thermal_throttled = True
+                self._log(f"Thermal: Throttled face detection (temp={temp_c:.1f}°C > {self._temp_override_threshold}°C)")
+        except Exception:
+            pass  # Silent fail on temp read
+    
     def process_frame(self, frame):
         """
         Process a frame through the detection pipeline.
@@ -460,6 +515,9 @@ class DetectionPipeline:
         Returns:
             List of person detections with tracking info
         """
+        # Check thermal status and potentially throttle
+        self._check_and_update_thermal_throttle()
+        
         # Process through human identification
         results = self.identification_service.process_frame(frame)
         
@@ -490,24 +548,33 @@ class DetectionPipeline:
                 
                 self.person_tracker.increment_attempts(pid)
         
-        # Submit new face detection jobs for unidentified persons
+        # Submit new face detection jobs for unidentified persons (with thermal throttling)
         for person in results:
             person_id = person['id']
             if (person['bbox'] is not None
                     and person['ready_to_save']
                     and self.face_worker is not None
-                    and not self.person_tracker.is_identified(person_id)
                     and person_id not in self.in_flight
-                    and self.person_tracker.can_attempt(person_id, self.face_cooldown)):
+                    and not self._thermal_throttled
+                    and not self._face_matching_disabled):  # Skip if critically thermally disabled
                 crop = person.get('crop')
                 if crop is not None:
+                    if not self.enable_face_matching:
+                        if person_id in self.ppe_processed:
+                            continue
+                        # PPE-only mode for crash isolation; identity stays Unknown.
+                        job_type = 'ppe'
+                        self._log(f"Person {person_id}: PPE-only job submitted (face matching disabled)")
                     # First submission: do both face and PPE; later: face-only retries
-                    if person_id not in self.ppe_processed:
+                    elif person_id not in self.ppe_processed:
                         job_type = 'face+ppe'
                         self._log(f"Person {person_id}: Face+PPE detection job submitted")
-                    else:
+                    elif (not self.person_tracker.is_identified(person_id)
+                          and self.person_tracker.can_attempt(person_id, self.face_cooldown)):
                         job_type = 'face'
                         self._log(f"Person {person_id}: Face detection retry submitted")
+                    else:
+                        continue
                     
                     submitted = self.face_worker.submit(person_id, crop.copy(), job_type=job_type)
                     if submitted:

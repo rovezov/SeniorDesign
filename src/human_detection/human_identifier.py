@@ -50,7 +50,10 @@ class HumanIdentificationService:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"YOLO model not found at {model_path}")
         
-        self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 1
+        so.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(model_path, sess_options=so, providers=['CPUExecutionProvider'])
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = 640
         
