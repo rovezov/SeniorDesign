@@ -419,22 +419,22 @@ class DetectionPipeline:
             self.ppe_detector = None
     
     def _init_face_worker(self):
-        """Initialize face worker with an ultralight face matcher."""
+        """Initialize face worker with a powerful ResNet-50 face matcher."""
         try:
             self._vprint("Initializing face/PPE worker and warming up...")
             self._log("Initializing face/PPE worker and warming up...")
-            # Default to the ultralight OpenCV LBPH backend, with InsightFace as fallback.
-            face_matcher = FaceMatcher(prefer_lightweight=True, use_alignment=False) if self.enable_face_matching else None
+            # Uses ResNet-50 (buffalo_l) via InsightFace with landmark alignment for best accuracy.
+            face_matcher = FaceMatcher() if self.enable_face_matching else None
             if not self.enable_face_matching:
                 self._log("Face matching is DISABLED for this run; identities will remain Unknown")
             else:
                 backend_name = getattr(face_matcher, "_mode", "unknown") if face_matcher is not None else "unknown"
-                if backend_name == "lbph":
-                    self._log("Face matching is ENABLED in ultralight LBPH mode (OpenCV Haar cascade + LBPH recognizer)")
-                elif backend_name == "insightface":
-                    self._log("Face matching is ENABLED in lightweight InsightFace mode (buffalo_sc, alignment disabled)")
+                if backend_name == "insightface":
+                    self._log("Face matching is ENABLED with ResNet-50 ArcFace (buffalo_l) + landmark alignment")
+                elif backend_name == "onnx":
+                    self._log("Face matching is ENABLED with ONNX ArcFace model")
                 else:
-                    self._log("Face matching is ENABLED with an unknown backend selection")
+                    self._log("Face matching is ENABLED with unknown backend selection")
             # Keep worker count conservative on embedded systems to reduce CPU pressure.
             self.face_worker = FaceWorker(
                 face_matcher,

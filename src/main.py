@@ -12,6 +12,10 @@ Supports multiple camera backends:
 Usage:
     python main.py --mode pipeline [--camera-backend webcam|pi] [--camera ID] [--fps FPS] [--verbose]
     python main.py --mode display [--camera-backend webcam|pi] [--camera ID] [--fps FPS] [--verbose]
+    python main.py --mode pipeline --stream-host 192.168.1.178 --stream-port 9001 [--fps FPS]
+
+Stream to Windows via H.265 UDP:
+    python main.py --mode pipeline --camera-backend pi --stream-host <WINDOWS_IP> --stream-port 9001
 
 Controls (Display Mode):
     Press 'q' or ESC to quit
@@ -287,7 +291,7 @@ def _atomic_save_jpeg(path: str, image, quality: int = 95) -> bool:
                 pass
 
 
-def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', debug_camera=False, face_workers=1):
+def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', debug_camera=False, face_workers=1, stream_host=None, stream_port=9001):
     """
     Run detection pipeline without display (ideal for embedded/headless systems)
     
@@ -298,7 +302,11 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
         edge_margin: Pixels from edge to filter detections
         verbose: Enable verbose logging
         ppe_requirements: List of required PPE items
-        camera_backend: 'auto', 'pi', or 'usb'
+        camera_backend: 'auto', 'pi', or 'webcam'
+        debug_camera: Enable periodic camera heartbeat logging
+        face_workers: Number of face matching worker threads
+        stream_host: Destination IP for H.265 UDP streaming (enables streaming mode if provided)
+        stream_port: UDP port for streaming (default: 9001)
     """
     def vprint(*args, **kwargs):
         if verbose:
@@ -309,11 +317,24 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
     setup_logging(output_dir)
     log_runtime_diagnostics(camera_backend, fps)
     
-    logging.info(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
-    vprint(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
+    # Determine actual backend
+    if stream_host:
+        actual_backend = 'stream'
+        logging.info(f"Starting pipeline-only mode with H.265 streaming to {stream_host}:{stream_port}")
+        vprint(f"Starting pipeline-only mode with H.265 streaming to {stream_host}:{stream_port}")
+    else:
+        actual_backend = camera_backend
+        logging.info(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
+        vprint(f"Starting pipeline-only mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
     
-    # Initialize camera
-    camera = Camera(camera_id=camera_id, fps=fps, backend=camera_backend)
+    # Initialize camera with streaming if requested
+    camera = Camera(
+        camera_id=camera_id,
+        fps=fps,
+        backend=actual_backend,
+        stream_host=stream_host,
+        stream_port=stream_port
+    )
     
     # Initialize detection pipeline
     ppe_requirements = ppe_requirements or ['vest']
@@ -436,7 +457,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
         logging.info("Stage: cleanup complete")
 
 
-def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto'):
+def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', stream_host=None, stream_port=9001):
     """
     Run detection pipeline with real-time video display and overlays
     
@@ -447,7 +468,9 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
         edge_margin: Pixels from edge to filter detections
         verbose: Enable verbose logging
         ppe_requirements: List of required PPE items
-        camera_backend: 'auto', 'pi', or 'usb'
+        camera_backend: 'auto', 'pi', or 'webcam'
+        stream_host: Destination IP for H.265 UDP streaming (enables streaming mode if provided)
+        stream_port: UDP port for streaming (default: 9001)
     """
     def vprint(*args, **kwargs):
         if verbose:
@@ -457,11 +480,24 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
     output_dir = os.path.join(os.path.dirname(__file__), 'Output')
     setup_logging(output_dir)
     
-    logging.info(f"Starting display mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
-    vprint(f"Starting display mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
+    # Determine actual backend
+    if stream_host:
+        actual_backend = 'stream'
+        logging.info(f"Starting display mode with H.265 streaming to {stream_host}:{stream_port}")
+        vprint(f"Starting display mode with H.265 streaming to {stream_host}:{stream_port}")
+    else:
+        actual_backend = camera_backend
+        logging.info(f"Starting display mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
+        vprint(f"Starting display mode (Camera {camera_id}, {fps} FPS, backend={camera_backend})")
     
-    # Initialize camera
-    camera = Camera(camera_id=camera_id, fps=fps, backend=camera_backend)
+    # Initialize camera with streaming if requested
+    camera = Camera(
+        camera_id=camera_id,
+        fps=fps,
+        backend=actual_backend,
+        stream_host=stream_host,
+        stream_port=stream_port
+    )
     
     # Initialize detection pipeline
     ppe_requirements = ppe_requirements or ['vest']
@@ -639,6 +675,10 @@ Examples:
                        help='Enable periodic camera/pipeline heartbeat logging (default: False)')
     parser.add_argument('--face-workers', type=int, default=1,
                        help='Background face/PPE worker threads for edge mode (default: 1)')
+    parser.add_argument('--stream-host', type=str, default=None,
+                       help='Destination IP address for H.265 UDP streaming (enables streaming if provided)')
+    parser.add_argument('--stream-port', type=int, default=9001,
+                       help='UDP port for streaming (default: 9001)')
     
     args = parser.parse_args()
     configure_runtime_threads(onnx_threads=1)
@@ -656,6 +696,8 @@ Examples:
             camera_backend=args.camera_backend,
             debug_camera=args.debug_camera,
             face_workers=args.face_workers,
+            stream_host=args.stream_host,
+            stream_port=args.stream_port,
         )
     else:  # display mode
         logging.info(f"Running in DISPLAY mode with camera backend={args.camera_backend}...")
@@ -667,7 +709,9 @@ Examples:
             edge_margin=args.edge_margin,
             verbose=args.verbose,
             ppe_requirements=args.ppe,
-            camera_backend=args.camera_backend
+            camera_backend=args.camera_backend,
+            stream_host=args.stream_host,
+            stream_port=args.stream_port,
         )
 
 
