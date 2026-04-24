@@ -7,11 +7,11 @@
 set -e
 
 echo "Installing requirements..."
-python -m pip install --break-system-packages -r requirements.txt
+python3 -m pip install --break-system-packages -r requirements.txt
 
 echo ""
 echo "Removing OpenCV wheel variants that can conflict with the system cv2 build..."
-python -m pip uninstall --break-system-packages -y opencv-contrib-python opencv-contrib-python-headless opencv-python opencv-python-headless 2>/dev/null || true
+python3 -m pip uninstall --break-system-packages -y opencv-contrib-python opencv-contrib-python-headless opencv-python opencv-python-headless 2>/dev/null || true
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════════╗"

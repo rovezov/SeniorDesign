@@ -50,7 +50,7 @@ if [ -n "$WINDOWS_IP" ]; then
 fi
 
 echo "Starting pipeline..."
-python ./src/main.py --mode pipeline --fps 30 --camera-backend pi --ppe helmet vest --verbose --debug-camera --face-workers 1 $PIPELINE_ARGS
+python3 ./src/main.py --mode pipeline --fps 30 --camera-backend pi --ppe helmet vest --verbose --debug-camera --face-workers 1 $PIPELINE_ARGS
 
 echo ""
 echo "Pipeline stopped."
