@@ -41,20 +41,18 @@ class Camera:
         self.total_frames_read = 0
 
     def start_pipeline(self):
-        # 1. Build the shared pipeline
-        # This opens the camera ONCE and splits (tees) the signal
+        # Build camera capture pipeline. Streaming is handled in main.py so
+        # we can transmit frames after overlays are drawn.
         if self.backend == 'stream':
             pipeline = (
                 f"qtiqmmfsrc camera={self.camera_id} ! "
                 "image/jpeg,width=640,height=480,framerate=30/1 ! "
-                "jpegdec ! videoconvert ! video/x-raw,format=NV12 ! "
-                "tee name=t "
-                "t. ! queue ! v4l2h264enc ! h264parse config-interval=-1 ! mpegtsmux ! "
-                f"udpsink host={self.stream_host} port={self.stream_port} sync=false async=false "
-                "t. ! queue ! videoconvert ! video/x-raw,format=BGR ! "
+                "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
                 "appsink drop=true max-buffers=1 sync=false"
             )
-            logging.info(f"Starting unified Stream + Capture pipeline to {self.stream_host}:{self.stream_port}")
+            logging.info(
+                f"Starting capture pipeline for overlay streaming to {self.stream_host}:{self.stream_port}"
+            )
             self.cap = _open_capture_with_timeout(pipeline, cv2.CAP_GSTREAMER)
             
         elif self.backend == 'pi':
