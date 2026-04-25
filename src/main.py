@@ -26,11 +26,13 @@ import time
 import os
 import glob
 import tempfile
+import queue
 import cv2
 import logging
 import traceback
 import threading
 from datetime import datetime
+from logging.handlers import QueueHandler, QueueListener
 from camera.camera_feed import Camera
 from detection_pipeline import DetectionPipeline
 from display import DisplayRenderer
@@ -75,7 +77,7 @@ def setup_logging(output_dir):
     
     # Configure logging with fresh handlers
     logger.setLevel(logging.INFO)
-    
+
     # File handler
     file_handler = logging.FileHandler(log_file, mode='a')
     file_handler.setLevel(logging.INFO)
@@ -85,12 +87,15 @@ def setup_logging(output_dir):
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    
-    # Add handlers to logger
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    return log_file
+
+    log_queue = queue.Queue()
+    queue_handler = QueueHandler(log_queue)
+    logger.addHandler(queue_handler)
+
+    listener = QueueListener(log_queue, file_handler, console_handler, respect_handler_level=True)
+    listener.start()
+
+    return log_file, listener
 
 
 def log_runtime_diagnostics(camera_backend, fps):
@@ -205,7 +210,7 @@ class RuntimeHealthMonitor:
 
 
 class OverlayStreamer:
-    """Pushes processed BGR frames to UDP via GStreamer."""
+    """Pushes processed BGR frames to UDP via GStreamer at fixed output FPS."""
 
     def __init__(self, host: str, port: int, fps: int):
         self.host = host
@@ -213,49 +218,86 @@ class OverlayStreamer:
         self.fps = max(1, int(fps))
         self._writer = None
         self._size = None
+        self._latest_frame = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
 
     def _build_pipeline(self, width: int, height: int) -> str:
         return (
             "appsrc is-live=true block=false format=time do-timestamp=true ! "
             f"video/x-raw,format=BGR,width={width},height={height},framerate={self.fps}/1 ! "
-            "queue leaky=downstream max-size-buffers=2 ! "
+            "queue leaky=downstream max-size-buffers=1 ! "
             "videoconvert ! video/x-raw,format=NV12 ! "
             "v4l2h264enc ! h264parse config-interval=-1 ! mpegtsmux ! "
             f"udpsink host={self.host} port={self.port} sync=false async=false"
         )
 
+    def _open_writer(self, width: int, height: int):
+        size = (width, height)
+        pipeline = self._build_pipeline(width, height)
+        writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, float(self.fps), size, True)
+        if not writer.isOpened():
+            writer.release()
+            raise RuntimeError(
+                f"Failed to open overlay stream writer for {self.host}:{self.port} at {width}x{height}"
+            )
+        self._writer = writer
+        self._size = size
+        logging.info(f"Overlay streaming started: udp://{self.host}:{self.port} ({width}x{height}@{self.fps})")
+
+    def _run(self):
+        frame_interval = 1.0 / float(self.fps)
+        while not self._stop_event.is_set():
+            t0 = time.time()
+
+            frame = None
+            with self._lock:
+                if self._latest_frame is not None:
+                    frame = self._latest_frame
+
+            if frame is not None:
+                h, w = frame.shape[:2]
+                target_size = (w, h)
+                try:
+                    if self._writer is None:
+                        self._open_writer(w, h)
+                    elif self._size != target_size:
+                        self._writer.release()
+                        self._writer = None
+                        self._size = None
+                        self._open_writer(w, h)
+                    self._writer.write(frame)
+                except Exception as e:
+                    logging.info(f"Overlay streaming write error: {e}")
+
+            elapsed = time.time() - t0
+            delay = frame_interval - elapsed
+            if delay > 0:
+                time.sleep(delay)
+
     def write(self, frame):
         if frame is None or getattr(frame, "shape", None) is None:
             return
 
-        h, w = frame.shape[:2]
-        size = (w, h)
-        if self._writer is None:
-            pipeline = self._build_pipeline(w, h)
-            self._writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, float(self.fps), size, True)
-            if not self._writer.isOpened():
-                self._writer = None
-                raise RuntimeError(
-                    f"Failed to open overlay stream writer for {self.host}:{self.port} at {w}x{h}"
-                )
-            self._size = size
-            logging.info(f"Overlay streaming started: udp://{self.host}:{self.port} ({w}x{h}@{self.fps})")
-        elif size != self._size:
-            # Frame size changed; reinitialize writer for the new stream caps.
-            self.release()
-            pipeline = self._build_pipeline(w, h)
-            self._writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, float(self.fps), size, True)
-            if not self._writer.isOpened():
-                self._writer = None
-                raise RuntimeError(
-                    f"Failed to reopen overlay stream writer for {self.host}:{self.port} at {w}x{h}"
-                )
-            self._size = size
-            logging.info(f"Overlay streaming resized to {w}x{h}")
+        # Keep only the latest processed frame. The sender thread transmits this
+        # at fixed FPS, which keeps network output smooth even under heavy inference load.
+        with self._lock:
+            self._latest_frame = frame
 
-        self._writer.write(frame)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="OverlayStreamer")
+            self._thread.start()
 
     def release(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+        with self._lock:
+            self._latest_frame = None
+
         if self._writer is not None:
             self._writer.release()
             self._writer = None
@@ -373,7 +415,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
     
     # Output directory
     output_dir = os.path.join(os.path.dirname(__file__), 'Output')
-    setup_logging(output_dir)
+    _, log_listener = setup_logging(output_dir)
     log_runtime_diagnostics(camera_backend, fps)
     
     # Determine actual backend
@@ -413,7 +455,6 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
             pass
     
     frame_count = 0
-    fps_history = []
     last_cleanup = time.time()
     cleanup_interval = 3600  # 1 hour
     health_monitor = RuntimeHealthMonitor(camera, lambda: frame_count, interval_sec=1.0)
@@ -488,12 +529,6 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
                 last_cleanup = time.time()
 
             if streamer is not None:
-                elapsed = time.time() - t0 or 1e-6
-                fps_history.append(1.0 / elapsed)
-                if len(fps_history) > 30:
-                    fps_history.pop(0)
-                avg_fps = sum(fps_history) / len(fps_history)
-                DisplayRenderer.draw_statistics_overlay(frame, results, pipeline, avg_fps)
                 streamer.write(frame)
         
         # Handle remaining tracked persons on exit
@@ -535,6 +570,8 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
         if streamer is not None:
             streamer.release()
         logging.info("Stage: cleanup complete")
+        if log_listener is not None:
+            log_listener.stop()
 
 
 def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', stream_host=None, stream_port=9001):
@@ -558,7 +595,7 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
     
     # Output directory
     output_dir = os.path.join(os.path.dirname(__file__), 'Output')
-    setup_logging(output_dir)
+    _, log_listener = setup_logging(output_dir)
     
     # Determine actual backend
     if stream_host:
@@ -642,6 +679,13 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
                 # Draw overlays on frame
                 # ------------------------------------------------------------------
                 DisplayRenderer.draw_person_overlays(frame, person, pipeline)
+
+            elapsed = max(1e-6, time.time() - t0)
+            fps_history.append(1.0 / elapsed)
+            if len(fps_history) > 15:
+                fps_history.pop(0)
+            avg_fps = sum(fps_history) / len(fps_history)
+            DisplayRenderer.draw_statistics_overlay(frame, results, pipeline, avg_fps)
             
             # Clean up departed IDs immediately after processing
             if had_departures:
@@ -649,18 +693,6 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
                 if cleared > 0:
                     vprint(f"[{frame_count}|{_ts()}] Cleaned up {cleared} departed IDs from memory")
             
-            # Calculate FPS
-            elapsed = time.time() - t0 or 1e-6
-            fps_history.append(1.0 / elapsed)
-            if len(fps_history) > 30:
-                fps_history.pop(0)
-            avg_fps = sum(fps_history) / len(fps_history)
-            
-            # ------------------------------------------------------------------
-            # Draw statistics overlay
-            # ------------------------------------------------------------------
-            DisplayRenderer.draw_statistics_overlay(frame, results, pipeline, avg_fps)
-
             if streamer is not None:
                 streamer.write(frame)
             
@@ -715,6 +747,9 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
         camera.release()
         if streamer is not None:
             streamer.release()
+        logging.info("Stage: cleanup complete")
+        if log_listener is not None:
+            log_listener.stop()
         cv2.destroyAllWindows()
 
 

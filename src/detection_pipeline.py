@@ -16,6 +16,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import os
+import logging
 from human_detection.human_identifier import HumanIdentificationService
 from face_detection.face_detector import detect_face
 from face_matching.face_matcher import FaceMatcher
@@ -120,9 +121,11 @@ class FaceWorker:
                     if self._session_logger:
                         self._session_logger(f"Person {person_id}: Face detected in crop")
                     
-                    # Get match result and all candidate scores for debugging
+                    # Get match result. Candidate scores are only computed in verbose/debug mode.
                     name, confidence = self._matcher.match_face_image(face_crop)
-                    all_scores = self._matcher.get_all_match_scores(face_crop) if hasattr(self._matcher, 'get_all_match_scores') else {}
+                    all_scores = {}
+                    if self._verbose and hasattr(self._matcher, 'get_all_match_scores'):
+                        all_scores = self._matcher.get_all_match_scores(face_crop)
                     
                     if name and name.lower() != "unknown":
                         if self._verbose:
@@ -265,11 +268,18 @@ class PersonTracker:
         self.last_attempt_time[person_id] = time.time()
         return self.face_attempts[person_id]
 
-    def can_attempt(self, person_id, cooldown_seconds: float = 1.5) -> bool:
-        """Return True if enough time has passed since the last attempt."""
+    def can_attempt(self, person_id, initial_cooldown: float = 1.0, slow_cooldown: float = 3.0, fast_attempts: int = 5) -> bool:
+        """Return True if enough time has passed since the last attempt.
+
+        Uses a faster retry cadence for the first few attempts, then slows down
+        to reduce CPU load when a person remains unidentified.
+        """
         last = self.last_attempt_time.get(person_id)
         if last is None:
             return True
+
+        attempts = self.face_attempts.get(person_id, 0)
+        cooldown_seconds = initial_cooldown if attempts < fast_attempts else slow_cooldown
         return (time.time() - last) >= cooldown_seconds
     
     def get_vote_stats(self, person_id):
@@ -351,8 +361,6 @@ class PersonTracker:
 class DetectionPipeline:
     """Orchestrates the detection pipeline: human detection, face detection, matching, and PPE detection"""
     
-    SESSION_LOG_PATH = "src/Output/session_log.txt"
-    
     def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.17, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True):
         """
         Initialize the detection pipeline.
@@ -369,7 +377,6 @@ class DetectionPipeline:
         self.ppe_requirements = ppe_requirements or []
         self.face_workers = max(1, int(face_workers))
         self.enable_face_matching = bool(enable_face_matching)
-        self._log_lock = threading.Lock()
         
         # Clear and initialize session log
         self._init_session_log()
@@ -398,7 +405,9 @@ class DetectionPipeline:
         )
         self.in_flight = set()  # Tracks person IDs with pending face detection jobs
         self.ppe_processed = set()  # Tracks person IDs that have completed PPE detection
-        self.face_cooldown = 1.0  # Increased from 0.05 to further reduce CPU load and thermal stress
+        self.face_cooldown = 1.0  # Initial retry interval for face matching
+        self.face_retry_limit = 5
+        self.face_retry_slow_cooldown = 3.0
         
         # Thermal throttling: pause face detection if CPU overheats
         self._thermal_throttled = False
@@ -406,6 +415,8 @@ class DetectionPipeline:
         self._temp_resume_threshold = 60.0   # Celsius - resume below this
         self._face_matching_disabled = False  # Permanently disable if CPU reaches critical temp
         self._critical_temp_threshold = 80.0  # Celsius - hard disable face matching above this
+        self._last_thermal_check = 0.0
+        self._thermal_check_interval = 1.0
     
     def _init_ppe_detector(self):
         """Initialize PPE detector"""
@@ -453,27 +464,12 @@ class DetectionPipeline:
             self.face_worker = None
     
     def _init_session_log(self):
-        """Clear and initialize the session log file"""
-        try:
-            log_dir = os.path.dirname(self.SESSION_LOG_PATH)
-            if log_dir and not os.path.exists(log_dir):
-                os.makedirs(log_dir, exist_ok=True)
-            # Clear the log file
-            with open(self.SESSION_LOG_PATH, 'w') as f:
-                f.write("")
-        except Exception as e:
-            print(f"Warning: Could not initialize session log: {e}")
+        """Log system ready (actual logging is handled by main.py setup_logging)"""
+        pass
     
     def _log(self, message: str):
-        """Write a message to the session log file with timestamp"""
-        try:
-            with self._log_lock:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                with open(self.SESSION_LOG_PATH, 'a') as f:
-                    f.write(f"[{timestamp}] {message}\n")
-        except Exception as e:
-            if self.verbose:
-                print(f"Warning: Could not write to session log: {e}")
+        """Log a message using the standard Python logging system (asynchronous + buffered by QueueListener)"""
+        logging.info(message)
     
     def _vprint(self, *args, **kwargs):
         """Conditional verbose print"""
@@ -482,6 +478,11 @@ class DetectionPipeline:
     
     def _check_and_update_thermal_throttle(self):
         """Check CPU temperature and update thermal throttle state."""
+        now = time.time()
+        if now - self._last_thermal_check < self._thermal_check_interval:
+            return
+        self._last_thermal_check = now
+
         try:
             temp_path = "/sys/class/thermal/thermal_zone0/temp"
             with open(temp_path, "r") as f:
@@ -524,10 +525,10 @@ class DetectionPipeline:
         # Log detected persons and track them
         for person in results:
             person_id = person['id']
-            if person['bbox'] is not None:
-                self._log(f"Person {person_id}: Detected in frame")
-            if person['ready_to_save']:
-                self._log(f"Person {person_id}: Tracking confirmed (ready_to_save=True)")
+            # if person['bbox'] is not None:
+            #     self._log(f"Person {person_id}: Detected in frame")
+            # if person['ready_to_save']:
+            #     self._log(f"Person {person_id}: Tracking confirmed (ready_to_save=True)")
         
         # Drain completed face/PPE results
         if self.face_worker is not None:
@@ -570,7 +571,12 @@ class DetectionPipeline:
                         job_type = 'face+ppe'
                         self._log(f"Person {person_id}: Face+PPE detection job submitted")
                     elif (not self.person_tracker.is_identified(person_id)
-                          and self.person_tracker.can_attempt(person_id, self.face_cooldown)):
+                          and self.person_tracker.can_attempt(
+                              person_id,
+                              initial_cooldown=self.face_cooldown,
+                              slow_cooldown=self.face_retry_slow_cooldown,
+                              fast_attempts=self.face_retry_limit,
+                          )):
                         job_type = 'face'
                         self._log(f"Person {person_id}: Face detection retry submitted")
                     else:

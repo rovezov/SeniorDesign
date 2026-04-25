@@ -54,8 +54,11 @@ class HumanIdentificationService:
         so.intra_op_num_threads = 1
         so.inter_op_num_threads = 1
         self.session = ort.InferenceSession(model_path, sess_options=so, providers=['CPUExecutionProvider'])
-        self.input_name = self.session.get_inputs()[0].name
-        self.input_size = 640
+        model_input = self.session.get_inputs()[0]
+        self.input_name = model_input.name
+        # Prefer 512 for performance, but respect fixed-shape ONNX models
+        # (e.g. yolov8n.onnx exported at 640x640).
+        self.input_size = self._resolve_input_size(model_input, preferred=512)
         
         self.tracker = HumanTracker(
             max_disappeared=10,
@@ -64,6 +67,26 @@ class HumanIdentificationService:
             max_centroid_distance=max_centroid_distance
         )
         self.saved_ids = set()
+
+    def _resolve_input_size(self, model_input, preferred=512):
+        """Return a safe square input size for the loaded ONNX model.
+
+        If the model has fixed H/W dimensions, those are used.
+        If dimensions are dynamic, the preferred size is used.
+        """
+        shape = getattr(model_input, 'shape', None)
+        if not shape or len(shape) < 4:
+            return int(preferred)
+
+        h = shape[2]
+        w = shape[3]
+        # Dynamic dimensions are often strings like 'height'/'width' or None.
+        if isinstance(h, int) and isinstance(w, int) and h > 0 and w > 0:
+            if h != w:
+                return int(min(h, w))
+            return int(h)
+
+        return int(preferred)
     
     def process_frame(self, frame):
         """Process frame and return detected/tracked persons with quality-based crop selection"""
