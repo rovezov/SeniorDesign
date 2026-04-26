@@ -38,6 +38,9 @@ from detection_pipeline import DetectionPipeline
 from display import DisplayRenderer
 
 
+SILENCEABLE_MODELS = ['ppe', 'face', 'human', 'matching']
+
+
 def _ts() -> str:
     """Current wall-clock time as HH:MM:SS.mmm for log prefixes."""
     t = time.localtime()
@@ -392,7 +395,7 @@ def _atomic_save_jpeg(path: str, image, quality: int = 95) -> bool:
                 pass
 
 
-def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', debug_camera=False, face_workers=1, stream_host=None, stream_port=9001):
+def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', debug_camera=False, face_workers=1, stream_host=None, stream_port=9001, silenced_models=None):
     """
     Run detection pipeline without display (ideal for embedded/headless systems)
     
@@ -445,6 +448,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
         edge_margin=edge_margin,
         verbose=verbose,
         face_workers=face_workers,
+        silenced_models=silenced_models,
     )
     
     # Clear previous output images
@@ -574,7 +578,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
             log_listener.stop()
 
 
-def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', stream_host=None, stream_port=9001):
+def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=False, ppe_requirements=None, camera_backend='auto', stream_host=None, stream_port=9001, silenced_models=None):
     """
     Run detection pipeline with real-time video display and overlays
     
@@ -622,7 +626,8 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
         ppe_requirements=ppe_requirements,
         min_tracking_time=0.5,
         edge_margin=edge_margin,
-        verbose=verbose
+        verbose=verbose,
+        silenced_models=silenced_models,
     )
     
     # Clear previous output images
@@ -800,9 +805,15 @@ Examples:
                        help='Destination IP address for H.265 UDP streaming (enables streaming if provided)')
     parser.add_argument('--stream-port', type=int, default=9001,
                        help='UDP port for streaming (default: 9001)')
+    parser.add_argument('--silence-models', type=str, nargs='+', choices=SILENCEABLE_MODELS, default=[],
+                       help='Silence selected models and dry-run them. Choices: ppe, face, human, matching')
     
     args = parser.parse_args()
     configure_runtime_threads(onnx_threads=1)
+    silenced_models = set(args.silence_models or [])
+    if silenced_models:
+        logging.info(f"Silenced models requested: {', '.join(sorted(silenced_models))}")
+        print(f"Silenced models requested: {', '.join(sorted(silenced_models))}")
     
     if args.mode == 'pipeline':
         logging.info(f"Running in PIPELINE mode (no display) with camera backend={args.camera_backend}...")
@@ -819,6 +830,7 @@ Examples:
             face_workers=args.face_workers,
             stream_host=args.stream_host,
             stream_port=args.stream_port,
+            silenced_models=silenced_models,
         )
     else:  # display mode
         logging.info(f"Running in DISPLAY mode with camera backend={args.camera_backend}...")
@@ -833,6 +845,7 @@ Examples:
             camera_backend=args.camera_backend,
             stream_host=args.stream_host,
             stream_port=args.stream_port,
+            silenced_models=silenced_models,
         )
 
 

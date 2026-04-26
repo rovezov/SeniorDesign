@@ -23,6 +23,22 @@ from face_matching.face_matcher import FaceMatcher
 from ppe_detection.ppe_detector import PPEDetector
 
 
+class _DryRunHumanIdentificationService:
+    """Human service shim used when human model is silenced."""
+
+    def __init__(self):
+        self.saved_ids = set()
+
+    def process_frame(self, frame):
+        return []
+
+    def get_all_tracked_crops(self):
+        return []
+
+    def cleanup_departed(self):
+        return 0
+
+
 class FaceWorker:
     """Runs face detection + matching + PPE detection in a single background thread.
 
@@ -31,12 +47,16 @@ class FaceWorker:
     polled with ``drain_results()``.
     """
 
-    def __init__(self, face_matcher, ppe_detector: PPEDetector = None, num_workers: int = 2, maxsize: int = 8, verbose: bool = False, session_logger=None, enable_face_matching: bool = True):
+    def __init__(self, face_matcher, ppe_detector: PPEDetector = None, num_workers: int = 2, maxsize: int = 8, verbose: bool = False, session_logger=None, enable_face_matching: bool = True, silenced_models=None):
         self._matcher = face_matcher
         self._ppe_detector = ppe_detector
         self._verbose = verbose
         self._session_logger = session_logger
         self._enable_face_matching = bool(enable_face_matching)
+        self._silenced_models = set(silenced_models or [])
+        self._silence_face = 'face' in self._silenced_models
+        self._silence_matching = 'matching' in self._silenced_models
+        self._silence_ppe = 'ppe' in self._silenced_models
         # Bounded queue: if full, main thread skips instead of stacking up work
         self._q: queue.Queue = queue.Queue(maxsize=maxsize)
         self._results: dict = {}   # person_id -> (name, confidence, missing_items, all_present)
@@ -107,7 +127,12 @@ class FaceWorker:
         ppe_result = ([], True)  # (missing_items, all_present)
         
         # Process face detection/matching if requested
-        if job_type in ['face+ppe', 'face'] and self._enable_face_matching and self._matcher is not None:
+        if job_type in ['face+ppe', 'face'] and self._silence_face:
+            # Dry run: skip face detector + matcher, return a valid unknown result.
+            face_result = ("Unknown", 0.0)
+            if self._session_logger:
+                self._session_logger(f"Person {person_id}: Face model SILENCED (dry run)")
+        elif job_type in ['face+ppe', 'face'] and self._enable_face_matching:
             try:
                 # Face detection using insightface RetinaFace (robust to various angles and scales)
                 if self._session_logger:
@@ -122,10 +147,16 @@ class FaceWorker:
                         self._session_logger(f"Person {person_id}: Face detected in crop")
                     
                     # Get match result. Candidate scores are only computed in verbose/debug mode.
-                    name, confidence = self._matcher.match_face_image(face_crop)
-                    all_scores = {}
-                    if self._verbose and hasattr(self._matcher, 'get_all_match_scores'):
-                        all_scores = self._matcher.get_all_match_scores(face_crop)
+                    if self._silence_matching or self._matcher is None:
+                        name, confidence = "Unknown", 0.0
+                        all_scores = {}
+                        if self._session_logger:
+                            self._session_logger(f"Person {person_id}: Face matching model SILENCED (dry run)")
+                    else:
+                        name, confidence = self._matcher.match_face_image(face_crop)
+                        all_scores = {}
+                        if self._verbose and hasattr(self._matcher, 'get_all_match_scores'):
+                            all_scores = self._matcher.get_all_match_scores(face_crop)
                     
                     if name and name.lower() != "unknown":
                         if self._verbose:
@@ -161,7 +192,11 @@ class FaceWorker:
         if job_type in ['face+ppe', 'ppe']:
             try:
                 # PPE detection (on full resolution - preserves fine details for accuracy)
-                if self._ppe_detector is not None:
+                if self._silence_ppe:
+                    ppe_result = ([], True)
+                    if self._session_logger:
+                        self._session_logger(f"Person {person_id}: PPE model SILENCED (dry run)")
+                elif self._ppe_detector is not None:
                     if self._session_logger:
                         self._session_logger(f"Person {person_id}: PPE detection started")
                     ppe_detection_result = self._ppe_detector.detect(crop)
@@ -361,7 +396,7 @@ class PersonTracker:
 class DetectionPipeline:
     """Orchestrates the detection pipeline: human detection, face detection, matching, and PPE detection"""
     
-    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.17, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True):
+    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.17, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True, silenced_models=None):
         """
         Initialize the detection pipeline.
         
@@ -377,18 +412,25 @@ class DetectionPipeline:
         self.ppe_requirements = ppe_requirements or []
         self.face_workers = max(1, int(face_workers))
         self.enable_face_matching = bool(enable_face_matching)
+        self.silenced_models = set(silenced_models or [])
         
         # Clear and initialize session log
         self._init_session_log()
         self._log(f"=== Detection Pipeline Session Started ===")
+        if self.silenced_models:
+            self._log(f"Silenced models (dry run): {', '.join(sorted(self.silenced_models))}")
         
         # Initialize services
-        self.identification_service = HumanIdentificationService(
-            edge_margin=edge_margin,
-            min_tracking_time=min_tracking_time,
-            max_centroid_distance=150,
-            conf_threshold=0.15
-        )
+        if 'human' in self.silenced_models:
+            self._log("Human model is SILENCED (dry run mode)")
+            self.identification_service = _DryRunHumanIdentificationService()
+        else:
+            self.identification_service = HumanIdentificationService(
+                edge_margin=edge_margin,
+                min_tracking_time=min_tracking_time,
+                max_centroid_distance=150,
+                conf_threshold=0.15
+            )
         
         # Initialize face worker and PPE detector
         self.face_worker = None
@@ -420,6 +462,10 @@ class DetectionPipeline:
     
     def _init_ppe_detector(self):
         """Initialize PPE detector"""
+        if 'ppe' in self.silenced_models:
+            self._log("PPE model is SILENCED (dry run mode)")
+            self.ppe_detector = None
+            return
         try:
             self.ppe_detector = PPEDetector(requirements=self.ppe_requirements)
             self._vprint("PPE detector initialized successfully")
@@ -435,9 +481,14 @@ class DetectionPipeline:
             self._vprint("Initializing face/PPE worker and warming up...")
             self._log("Initializing face/PPE worker and warming up...")
             # Uses ResNet-50 (buffalo_l) via InsightFace with landmark alignment for best accuracy.
-            face_matcher = FaceMatcher() if self.enable_face_matching else None
+            disable_matching = ('matching' in self.silenced_models) or ('face' in self.silenced_models)
+            face_matcher = FaceMatcher() if (self.enable_face_matching and not disable_matching) else None
             if not self.enable_face_matching:
                 self._log("Face matching is DISABLED for this run; identities will remain Unknown")
+            elif 'face' in self.silenced_models:
+                self._log("Face model is SILENCED (dry run mode)")
+            elif 'matching' in self.silenced_models:
+                self._log("Face matching model is SILENCED (dry run mode)")
             else:
                 backend_name = getattr(face_matcher, "_mode", "unknown") if face_matcher is not None else "unknown"
                 if backend_name == "insightface":
@@ -455,6 +506,7 @@ class DetectionPipeline:
                 verbose=self.verbose,
                 session_logger=self._log,
                 enable_face_matching=self.enable_face_matching,
+                silenced_models=self.silenced_models,
             )
             self._vprint("Face/PPE worker initialized and warmed up successfully")
             self._log("Face/PPE worker initialized and warmed up successfully")
@@ -518,6 +570,10 @@ class DetectionPipeline:
         """
         # Check thermal status and potentially throttle
         self._check_and_update_thermal_throttle()
+
+        if 'human' in self.silenced_models:
+            # Dry run: no human detections this frame, but keep pipeline alive.
+            return []
         
         # Process through human identification
         results = self.identification_service.process_frame(frame)
