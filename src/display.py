@@ -62,19 +62,8 @@ class DisplayRenderer:
                        cv2.FONT_HERSHEY_SIMPLEX, 0.575, color, 2)
 
     @staticmethod
-    def draw_statistics_overlay(frame, results, pipeline, avg_fps):
-        """Draw side statistics overlay on frame."""
-        detected_count = sum(1 for p in results if p['bbox'] is not None)
-        identified_count = sum(1 for p in results if pipeline.person_tracker.is_identified(p['id']))
-
-        cv2.putText(frame, f"FPS: {avg_fps:.1f}", (10, 30),
+    def draw_statistics_overlay(frame, results, pipeline, current_fps, avg_fps=None):
+        """Draw FPS overlay on frame."""
+        cv2.putText(frame, f"FPS: {current_fps:.1f}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 1.15, (255, 255, 0), 2)
-        cv2.putText(frame, f"Detected: {detected_count}", (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.805, (255, 255, 255), 2)
-        cv2.putText(frame, f"Tracked: {len(results)}", (10, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.805, (255, 255, 255), 2)
-        cv2.putText(frame, f"Identified: {identified_count}", (10, 130),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.805, (255, 255, 255), 2)
-        cv2.putText(frame, f"Saved: {len(pipeline.identification_service.saved_ids)}", (10, 160),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.805, (255, 255, 255), 2)
     

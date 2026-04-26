@@ -2,7 +2,7 @@
 Face matching via deep-learning embeddings (ArcFace / MobileFaceNet).
 
 Backend priority (first available wins):
-  1. insightface buffalo_l   – ResNet-50, WebFace600K, ~166 MB ONNX
+    1. insightface buffalo_sc  – MobileFaceNet, WebFace600K, ~14 MB ONNX
   2. Raw ONNX session        – place any 112×112 → 512-d ArcFace model at
                                <module_dir>/arcface.onnx
 
@@ -44,8 +44,15 @@ BASE_DIR = os.path.dirname(__file__)
 # ArcFace / MobileFaceNet standard input size
 _IMG_SIZE = (112, 112)
 
-# Cosine-similarity threshold: raise to be stricter, lower to be more lenient
-DEFAULT_THRESHOLD = 0.25
+# ── Model selection ──────────────────────────────────────────────────────────
+# buffalo_l  = ResNet-50,      ~166 MB  – NOT safe on QCS6490 (FastRPC crash)
+# buffalo_sc = MobileFaceNet,  ~14 MB   – safe, ~99.1% LFW accuracy
+_INSIGHTFACE_PACK = "buffalo_sc"
+_INSIGHTFACE_MODEL = "w600k_mbf.onnx"
+
+# Cosine-similarity threshold: MobileFaceNet embeddings cluster slightly
+# tighter so 0.30 works well; raise to 0.35 if you get false positives.
+DEFAULT_THRESHOLD = 0.30
 
 # Where to look for per-person training image folders
 _CANDIDATE_DIRS = [
@@ -103,7 +110,7 @@ class FaceMatcher:
 
     Confidence semantics (CHANGED from LBPH version):
         confidence ∈ [0, 1]  —  higher means a better match.
-        A result below DEFAULT_THRESHOLD (0.35) is treated as "not recognised".
+        A result below DEFAULT_THRESHOLD (0.30) is treated as "not recognised".
 
     Usage::
 
@@ -138,52 +145,39 @@ class FaceMatcher:
 
     def _load_model(self):
         """Load best available recognition back-end."""
-        # ── 1. insightface model_zoo – load w600k_mbf directly ──────────────
-        # Prefer this over FaceAnalysis because newer insightface versions key
-        # app.models by filename (e.g. "w600k_mbf") rather than task name
-        # ("recognition"), causing app.models.get("recognition") to return None.
+        # ── 1. insightface model_zoo – prefer buffalo_sc (MobileFaceNet) ────────
+        # buffalo_l (ResNet-50, 166 MB) causes a FastRPC unmmap fault on QCS6490,
+        # locking the PWM/LPI clock domain and bricking the fan until reboot.
+        # buffalo_sc (MobileFaceNet, ~14 MB) stays well under the DSP memory limit.
         try:
             import insightface  # noqa: F401
             from insightface.model_zoo import get_model as _igfz_get_model
 
-            # buffalo_l uses ResNet-50 (w600k_r50.onnx) – much more accurate
-            # than buffalo_sc's MobileFaceNet (w600k_mbf.onnx).
-            _buffalo_dir = os.path.join(
-                os.path.expanduser("~"), ".insightface", "models", "buffalo_l"
+            _pack_dir = os.path.join(
+                os.path.expanduser("~"), ".insightface", "models", _INSIGHTFACE_PACK
             )
-            _r50_path = os.path.join(_buffalo_dir, "w600k_r50.onnx")
+            _model_path = os.path.join(_pack_dir, _INSIGHTFACE_MODEL)
 
             # Trigger download only when the file is missing
-            if not os.path.exists(_r50_path):
+            if not os.path.exists(_model_path):
                 from insightface.app import FaceAnalysis as _FA
                 _fa = _FA(
-                    name="buffalo_l",
+                    name=_INSIGHTFACE_PACK,
                     allowed_modules=["recognition"],
                     providers=["CPUExecutionProvider"],
                 )
                 _fa.prepare(ctx_id=-1, det_size=_IMG_SIZE)
 
-            if os.path.exists(_r50_path):
-                rec = _igfz_get_model(_r50_path, providers=["CPUExecutionProvider"])
+            if os.path.exists(_model_path):
+                rec = _igfz_get_model(_model_path, providers=["CPUExecutionProvider"])
                 rec.prepare(ctx_id=-1)
                 self._rec_model = rec
                 self._mode = "insightface"
-
-                # Load SCRFD detector for 5-point landmark alignment.
-                # ResNet-50 ArcFace needs aligned crops; without this step
-                # recognition accuracy drops significantly.
-                _det_path = os.path.join(_buffalo_dir, "det_10g.onnx")
-                if os.path.exists(_det_path):
-                    try:
-                        det = _igfz_get_model(_det_path,
-                                              providers=["CPUExecutionProvider"])
-                        # Use a compact input size; the crop is already a tight
-                        # person bbox so 128×128 is sufficient.
-                        det.prepare(ctx_id=-1, input_size=(128, 128),
-                                    det_thresh=0.4)
-                        self._det_model = det
-                    except Exception:
-                        pass  # alignment unavailable; fall back to raw get_feat
+                # NOTE: We intentionally skip the SCRFD alignment step here.
+                # MobileFaceNet is robust to moderate misalignment and loading
+                # det_10g.onnx adds memory pressure without meaningful accuracy gain
+                # at buffalo_sc's operating point.
+                self._det_model = None
                 return
         except Exception:
             pass
@@ -193,7 +187,7 @@ class FaceMatcher:
             import insightface  # noqa: F401
             from insightface.app import FaceAnalysis
             app = FaceAnalysis(
-                name="buffalo_l",
+                name=_INSIGHTFACE_PACK,
                 allowed_modules=["recognition"],
                 providers=["CPUExecutionProvider"],
             )
@@ -222,14 +216,14 @@ class FaceMatcher:
         # Check the module directory first, then the insightface cache.
         _onnx_candidates = [
             os.path.join(BASE_DIR, "arcface.onnx"),
-            os.path.join(
-                os.path.expanduser("~"),
-                ".insightface", "models", "buffalo_l", "w600k_r50.onnx",
-            ),
-            # Fall back to the smaller model if buffalo_l was never downloaded
+            # Prefer the smaller model to avoid FastRPC memory fault on QCS6490
             os.path.join(
                 os.path.expanduser("~"),
                 ".insightface", "models", "buffalo_sc", "w600k_mbf.onnx",
+            ),
+            os.path.join(
+                os.path.expanduser("~"),
+                ".insightface", "models", "buffalo_l", "w600k_r50.onnx",
             ),
         ]
         for onnx_path in _onnx_candidates:
@@ -410,7 +404,7 @@ class FaceMatcher:
         face_image : np.ndarray
             BGR face crop (any size; will be resized internally).
         threshold : float
-            Minimum cosine similarity to accept as a match (default 0.35).
+            Minimum cosine similarity to accept as a match (default 0.30).
 
         Returns
         -------

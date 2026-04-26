@@ -459,6 +459,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
             pass
     
     frame_count = 0
+    fps_history = []
     last_cleanup = time.time()
     cleanup_interval = 3600  # 1 hour
     health_monitor = RuntimeHealthMonitor(camera, lambda: frame_count, interval_sec=1.0)
@@ -519,6 +520,23 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
                 # Draw overlays even in pipeline-only mode when streaming.
                 if streamer is not None:
                     DisplayRenderer.draw_person_overlays(frame, person, pipeline)
+
+            elapsed = max(1e-6, time.time() - t0)
+            current_fps = 1.0 / elapsed
+            fps_history.append(current_fps)
+            if len(fps_history) > 15:
+                fps_history.pop(0)
+            avg_fps = sum(fps_history) / len(fps_history)
+
+            # Draw FPS/statistics on streamed output frames.
+            if streamer is not None:
+                DisplayRenderer.draw_statistics_overlay(
+                    frame,
+                    results,
+                    pipeline,
+                    current_fps=current_fps,
+                    avg_fps=avg_fps,
+                )
             
             # Clean up departed IDs immediately after processing
             if had_departures:
@@ -686,11 +704,18 @@ def run_display_mode(camera_id=0, fps=60, duration=None, edge_margin=0, verbose=
                 DisplayRenderer.draw_person_overlays(frame, person, pipeline)
 
             elapsed = max(1e-6, time.time() - t0)
-            fps_history.append(1.0 / elapsed)
+            current_fps = 1.0 / elapsed
+            fps_history.append(current_fps)
             if len(fps_history) > 15:
                 fps_history.pop(0)
             avg_fps = sum(fps_history) / len(fps_history)
-            DisplayRenderer.draw_statistics_overlay(frame, results, pipeline, avg_fps)
+            DisplayRenderer.draw_statistics_overlay(
+                frame,
+                results,
+                pipeline,
+                current_fps=current_fps,
+                avg_fps=avg_fps,
+            )
             
             # Clean up departed IDs immediately after processing
             if had_departures:
