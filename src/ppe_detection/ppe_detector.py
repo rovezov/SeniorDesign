@@ -52,7 +52,7 @@ class PPEDetector:
             raise FileNotFoundError(f"PPE model not found at: {model_path}")
 
         # Load label map [true labels found in labels.txt]
-        self._labels = list(self._VALID_LABELS)
+        self._labels = ["helmet", "vest"]
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = 1

@@ -46,9 +46,11 @@ class DisplayRenderer:
 
             # Draw PPE compliance status + missing items
             ppe_status = pipeline.person_tracker.get_ppe_status(person_id)
-            if ppe_status['is_non_compliant']:
+            
+            # Use 'current_compliant' for real-time video overlay
+            if not ppe_status.get('current_compliant', True):
                 compliance_text = "NON-COMPLIANT"
-                missing_items = ppe_status.get('missing', [])
+                missing_items = ppe_status.get('current_missing', [])
                 missing_text = "Missing: None" if not missing_items else f"Missing: {', '.join(missing_items)}"
                 color = (0, 0, 255)  # Red for non-compliant
             else:

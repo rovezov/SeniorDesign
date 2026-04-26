@@ -37,7 +37,6 @@ from camera.camera_feed import Camera
 from detection_pipeline import DetectionPipeline
 from display import DisplayRenderer
 
-
 SILENCEABLE_MODELS = ['ppe', 'face', 'human', 'matching']
 
 
@@ -320,16 +319,22 @@ def save_person_info(person_id, name, crop_image, output_dir, ppe_status=None):
         ppe_status: Dict with PPE compliance info
     """
     if ppe_status is None:
-        ppe_status = {'missing': [], 'compliant': True, 'is_non_compliant': False}
+        # Update default dictionary fallback to use the new keys
+        ppe_status = {
+            'current_missing': [], 'current_compliant': True,
+            'cumulative_missing': [], 'cumulative_compliant': True
+        }
     
     # Use name or "unknown_person" if name is Unknown
     name_part = name if name.lower() != "unknown" else "unknown_person"
     
-    # Build filename based on compliance status (includes person_id to prevent overwrites)
-    if ppe_status['is_non_compliant']:
-        missing_str = "_".join(ppe_status['missing'])
+    # Build filename based on CUMULATIVE compliance status (majority vote over time)
+    if not ppe_status.get('cumulative_compliant', True):
+        missing_str = "_".join(ppe_status.get('cumulative_missing', []))
         filename = os.path.join(output_dir, f"{name_part}_{person_id}_missing_{missing_str}.jpg")
-        status_str = f"MISSING: {', '.join(ppe_status['missing']).upper()}"
+        
+        missing_items = ppe_status.get('cumulative_missing', [])
+        status_str = f"MISSING: {', '.join(missing_items).upper()}"
     else:
         filename = os.path.join(output_dir, f"{name_part}_{person_id}_compliant.jpg")
         status_str = "COMPLIANT"
@@ -509,7 +514,7 @@ def run_pipeline_only(camera_id=0, fps=60, duration=None, edge_margin=0, verbose
                         
                         # Remove from tracking
                         pipeline.person_tracker.remove_person(person_id)
-                        pipeline.in_flight.discard(person_id)
+                        pipeline.in_flight.pop(person_id, None)
                         
                         vprint(f"[{frame_count}|{_ts()}] Person {person_id} departed - Name: {name}")
                         had_departures = True

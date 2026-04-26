@@ -5,7 +5,7 @@ Handles the core detection and tracking logic:
 - Human detection and tracking
 - Face detection, matching, and PPE detection in background threads
 - Identity voting system
-- PPE compliance tracking
+- PPE compliance tracking (Real-time and Cumulative)
 """
 
 import cv2
@@ -235,7 +235,7 @@ class FaceWorker:
 class PersonTracker:
     """Tracks person IDs with their identified names and PPE compliance using voting"""
     
-    def __init__(self, face_confidence_threshold=0.17, min_votes=1, ppe_confidence_threshold=0.75, ppe_min_votes=1):
+    def __init__(self, face_confidence_threshold=0.4, min_votes=1, ppe_confidence_threshold=0.75, ppe_min_votes=1):
         self.person_votes = {}  # person_id -> {name: [confidences]}
         self.person_names = {}  # person_id -> final decided name
         self.face_attempts = {}  # person_id -> number of face matching attempts
@@ -247,10 +247,11 @@ class PersonTracker:
         
         # PPE tracking
         self.ppe_votes = {}  # person_id -> {frozenset(detected_equipment): count}
-        self.ppe_status = {}  # person_id -> {'missing': [items], 'compliant': bool, 'is_non_compliant': bool}
-        self.ppe_confidence_threshold = ppe_confidence_threshold  # Confidence threshold for PPE votes
-        self.ppe_min_votes = ppe_min_votes  # Minimum votes for PPE determination
-    
+        self.ppe_status = {}  # person_id -> dict with current and cumulative stats
+        self.last_ppe_time = {} # person_id -> timestamp of last PPE attempt
+        self.ppe_confidence_threshold = ppe_confidence_threshold  
+        self.ppe_min_votes = ppe_min_votes
+
     def is_identified(self, person_id):
         """Check if person has been identified with a valid name (not Unknown)"""
         name = self.person_names.get(person_id, "Unknown")
@@ -330,53 +331,70 @@ class PersonTracker:
                 'best_confidence': max(confidences)  # higher cosine sim = better
             }
         return stats
-    
+
+    def can_attempt_ppe(self, person_id, cooldown: float = 1.0) -> bool:
+        """Check if enough time has passed to sample PPE again (default 1 sec)."""
+        last = self.last_ppe_time.get(person_id)
+        if last is None:
+            return True
+        return (time.time() - last) >= cooldown
+
+    def increment_ppe_attempts(self, person_id):
+        """Record the timestamp of a completed PPE check."""
+        self.last_ppe_time[person_id] = time.time()
+
     def add_ppe_result(self, person_id, missing_items, all_present):
-        """Add a PPE detection result and update compliance based on voting.
-        
-        Args:
-            person_id: Person tracking ID
-            missing_items: List of missing PPE items (e.g., ['helmet', 'vest'])
-            all_present: Boolean - True if all required PPE is present
-        """
+        """Add a PPE detection result and calculate both real-time and cumulative compliance."""
         if person_id not in self.ppe_votes:
             self.ppe_votes[person_id] = {}
         if person_id not in self.ppe_status:
-            self.ppe_status[person_id] = {'missing': [], 'compliant': True, 'is_non_compliant': False}
+            self.ppe_status[person_id] = {
+                'current_missing': [],
+                'current_compliant': True,
+                'cumulative_missing': [],
+                'cumulative_compliant': True,
+                'total_checks': 0,
+                'compliant_checks': 0
+            }
         
-        # Store vote as frozenset of missing items for counting
+        status = self.ppe_status[person_id]
+        
+        # 1. Update REAL-TIME instantaneous status for the overlay display
+        status['current_missing'] = missing_items
+        status['current_compliant'] = all_present
+        
+        # 2. Update CUMULATIVE status for the final saved entry
+        status['total_checks'] += 1
+        if all_present:
+            status['compliant_checks'] += 1
+            
+        # Store vote as frozenset of missing items for counting specific gear
         missing_key = frozenset(missing_items)
         self.ppe_votes[person_id][missing_key] = self.ppe_votes[person_id].get(missing_key, 0) + 1
         
-        # Recalculate best PPE status based on votes
-        votes = self.ppe_votes[person_id]
-        if not votes:
-            return
+        # Calculate majority compliance (they must be compliant > 50% of the time tracked)
+        compliance_ratio = status['compliant_checks'] / status['total_checks']
+        status['cumulative_compliant'] = compliance_ratio >= 0.5
         
-        # Find the missing items set with the most votes
-        best_missing_key = max(votes.keys(), key=lambda k: votes[k])
-        best_vote_count = votes[best_missing_key]
-        
-        # Only update if we have enough votes
-        if best_vote_count >= self.ppe_min_votes:
-            best_missing = sorted(list(best_missing_key))
-            is_now_compliant = (len(best_missing) == 0)
-            
-            # Once marked non-compliant, stay non-compliant
-            if not is_now_compliant:
-                self.ppe_status[person_id]['is_non_compliant'] = True
-            
-            self.ppe_status[person_id]['missing'] = best_missing
-            self.ppe_status[person_id]['compliant'] = is_now_compliant
-    
+        # If cumulatively non-compliant, find the most consistently missing items
+        if not status['cumulative_compliant']:
+            # Filter out compliant votes to find what is ACTUALLY missing most often
+            non_compliant_votes = {k: v for k, v in self.ppe_votes[person_id].items() if len(k) > 0}
+            if non_compliant_votes:
+                best_missing_key = max(non_compliant_votes.keys(), key=lambda k: non_compliant_votes[k])
+                status['cumulative_missing'] = sorted(list(best_missing_key))
+            else:
+                 status['cumulative_missing'] = status['current_missing']
+        else:
+            status['cumulative_missing'] = []
+
     def get_ppe_status(self, person_id):
-        """Get PPE compliance status for a person.
-        
-        Returns:
-            Dict with keys: 'missing' (list), 'compliant' (bool), 'is_non_compliant' (bool)
-        """
-        return self.ppe_status.get(person_id, {'missing': [], 'compliant': True, 'is_non_compliant': False})
-    
+        """Get the dual PPE status for a person."""
+        return self.ppe_status.get(person_id, {
+            'current_missing': [], 'current_compliant': True,
+            'cumulative_missing': [], 'cumulative_compliant': True
+        })
+
     def remove_person(self, person_id):
         """Remove person from tracking"""
         if person_id in self.person_names:
@@ -391,12 +409,14 @@ class PersonTracker:
             del self.ppe_votes[person_id]
         if person_id in self.ppe_status:
             del self.ppe_status[person_id]
+        if person_id in self.last_ppe_time:
+            del self.last_ppe_time[person_id]
 
 
 class DetectionPipeline:
     """Orchestrates the detection pipeline: human detection, face detection, matching, and PPE detection"""
     
-    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.17, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True, silenced_models=None):
+    def __init__(self, ppe_requirements=None, min_tracking_time=0.5, edge_margin=0, verbose=False, face_confidence_threshold=0.4, ppe_confidence_threshold=0.75, face_workers=1, enable_face_matching=True, silenced_models=None):
         """
         Initialize the detection pipeline.
         
@@ -405,7 +425,7 @@ class DetectionPipeline:
             min_tracking_time: Minimum time before a person is tracked (seconds)
             edge_margin: Pixels from edge to filter detections
             verbose: Enable verbose logging
-            face_confidence_threshold: Confidence threshold for face matching (0-1, default 0.17)
+            face_confidence_threshold: Confidence threshold for face matching (0-1, default 0.4)
             ppe_confidence_threshold: Confidence threshold for PPE detection (0-1, default 0.75)
         """
         self.verbose = verbose
@@ -443,10 +463,9 @@ class DetectionPipeline:
             face_confidence_threshold=face_confidence_threshold,
             min_votes=1,  # Edge optimization: confirm on first high-confidence match
             ppe_confidence_threshold=ppe_confidence_threshold,
-            ppe_min_votes=1  # Single PPE detection is enough (only runs once per person)
+            ppe_min_votes=1  # Continuous sampling logic handled via cooldown now
         )
-        self.in_flight = set()  # Tracks person IDs with pending face detection jobs
-        self.ppe_processed = set()  # Tracks person IDs that have completed PPE detection
+        self.in_flight = {}  # Tracks person IDs with pending face detection jobs
         self.face_cooldown = 1.0  # Initial retry interval for face matching
         self.face_retry_limit = 5
         self.face_retry_slow_cooldown = 3.0
@@ -557,39 +576,22 @@ class DetectionPipeline:
                 self._log(f"Thermal: Throttled face detection (temp={temp_c:.1f}°C > {self._temp_override_threshold}°C)")
         except Exception:
             pass  # Silent fail on temp read
-    
+
     def process_frame(self, frame):
-        """
-        Process a frame through the detection pipeline.
-        
-        Args:
-            frame: Input video frame (numpy array)
-            
-        Returns:
-            List of person detections with tracking info
-        """
         # Check thermal status and potentially throttle
         self._check_and_update_thermal_throttle()
 
         if 'human' in self.silenced_models:
-            # Dry run: no human detections this frame, but keep pipeline alive.
             return []
         
-        # Process through human identification
         results = self.identification_service.process_frame(frame)
-        
-        # Log detected persons and track them
-        for person in results:
-            person_id = person['id']
-            # if person['bbox'] is not None:
-            #     self._log(f"Person {person_id}: Detected in frame")
-            # if person['ready_to_save']:
-            #     self._log(f"Person {person_id}: Tracking confirmed (ready_to_save=True)")
         
         # Drain completed face/PPE results
         if self.face_worker is not None:
             for pid, result in self.face_worker.drain_results().items():
-                self.in_flight.discard(pid)
+                # Pop the job type so we know what just finished
+                job_type = self.in_flight.pop(pid, None) 
+                
                 name, confidence, missing_items, all_present = result
                 
                 # Process face match result
@@ -598,14 +600,20 @@ class DetectionPipeline:
                     if updated:
                         self._log(f"Person {pid}: Identity confirmed as {name} (confidence: {confidence:.4f})")
                 
-                # Process PPE detection result - mark as processed
+                # CRITICAL FIX: Always increment face attempts if a face job ran, 
+                # even if it failed, to properly trigger the cooldown!
+                if job_type in ['face', 'face+ppe'] or job_type is None:
+                    self.person_tracker.increment_attempts(pid)
+                
+                # Process PPE detection result
                 if missing_items is not None:
                     self.person_tracker.add_ppe_result(pid, missing_items, all_present)
-                    self.ppe_processed.add(pid)  # Track that PPE has been processed
                 
-                self.person_tracker.increment_attempts(pid)
+                # Increment PPE attempts to trigger the PPE cooldown
+                if job_type in ['ppe', 'face+ppe'] or job_type is None:
+                    self.person_tracker.increment_ppe_attempts(pid)
         
-        # Submit new face detection jobs for unidentified persons (with thermal throttling)
+        # Submit new face/PPE detection jobs
         for person in results:
             person_id = person['id']
             if (person['bbox'] is not None
@@ -613,37 +621,44 @@ class DetectionPipeline:
                     and self.face_worker is not None
                     and person_id not in self.in_flight
                     and not self._thermal_throttled
-                    and not self._face_matching_disabled):  # Skip if critically thermally disabled
+                    and not self._face_matching_disabled):
+                
                 crop = person.get('crop')
                 if crop is not None:
-                    if not self.enable_face_matching:
-                        if person_id in self.ppe_processed:
-                            continue
-                        # PPE-only mode for crash isolation; identity stays Unknown.
-                        job_type = 'ppe'
-                        self._log(f"Person {person_id}: PPE-only job submitted (face matching disabled)")
-                    # First submission: do both face and PPE; later: face-only retries
-                    elif person_id not in self.ppe_processed:
-                        job_type = 'face+ppe'
-                        self._log(f"Person {person_id}: Face+PPE detection job submitted")
-                    elif (not self.person_tracker.is_identified(person_id)
-                          and self.person_tracker.can_attempt(
-                              person_id,
-                              initial_cooldown=self.face_cooldown,
-                              slow_cooldown=self.face_retry_slow_cooldown,
-                              fast_attempts=self.face_retry_limit,
-                          )):
-                        job_type = 'face'
-                        self._log(f"Person {person_id}: Face detection retry submitted")
-                    else:
-                        continue
                     
-                    submitted = self.face_worker.submit(person_id, crop.copy(), job_type=job_type)
-                    if submitted:
-                        self.in_flight.add(person_id)
+                    # Evaluate what jobs we need to run
+                    needs_face = (not self.person_tracker.is_identified(person_id)
+                                  and self.person_tracker.can_attempt(
+                                      person_id,
+                                      initial_cooldown=self.face_cooldown,
+                                      slow_cooldown=self.face_retry_slow_cooldown,
+                                      fast_attempts=self.face_retry_limit,
+                                  ))
+                    
+                    # Sample PPE every 1.5 seconds to build the cumulative score without overloading
+                    needs_ppe = self.person_tracker.can_attempt_ppe(person_id, cooldown=1.5)
+                    
+                    job_type = None
+                    if not self.enable_face_matching:
+                        if needs_ppe: 
+                            job_type = 'ppe'
+                    else:
+                        if needs_face and needs_ppe:
+                            job_type = 'face+ppe'
+                        elif needs_face:
+                            job_type = 'face'
+                        elif needs_ppe:
+                            job_type = 'ppe'
+                    
+                    if job_type is not None:
+                        submitted = self.face_worker.submit(person_id, crop.copy(), job_type=job_type)
+                        if submitted:
+                            # Save the job type so we know what to cooldown later
+                            self.in_flight[person_id] = job_type  
         
         return results
-    
+
+
     def get_remaining_crops(self):
         """Get all remaining tracked person crops"""
         return self.identification_service.get_all_tracked_crops()
